@@ -3,7 +3,7 @@
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-gate 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/hieason4567-jpg/chenyu-gate-skill/main"
-$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs")
+$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs", "scripts/superi_lookup.mjs")
 
 $roots = @()
 $roots += Join-Path $env:USERPROFILE ".codex\skills"
