@@ -20,6 +20,16 @@ const die = (msg) => { console.error('✗ ' + msg); process.exit(1); };
 // ---------- 校验规则（与辰屿 Pro 完整版 gate 同源） ----------
 const GATE_MENTAL_RE = /心想|心中[想道]|心里[想暗默]|暗想|暗自[想道]|内心[想os]|回忆起|想起了|感到|觉得/;
 const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
+// 载具进出必须分场景(D类连续性):同一场景块内同时出现"上车/进车"与"下车/离开车"→警告。
+// 载具移动=位移,上车点与下车点是不同地点,写在同一场景会让转分镜做成同一地点。
+const VEHICLE_ENTER_RE = /上车|上了车|坐进[^。；;]{0,6}[车轿]|钻进[^。；;]{0,6}[车轿]|登上[^。；;]{0,4}车|爬上车顶|翻上车顶|坐上车顶|翻身坐(在|上)[^。；;]{0,6}车/;
+const VEHICLE_EXIT_RE = /下车|下了车|走下[^。；;]{0,4}车|跳下车|钻出[^。；;]{0,6}[车轿]|离开[^。；;]{0,4}[车轿]/;
+function checkVehicleSceneContinuity(sceneHead, texts, warnings) {
+  const joined = texts.join(' ');
+  if (VEHICLE_ENTER_RE.test(joined) && VEHICLE_EXIT_RE.test(joined)) {
+    warnings.push(`场景「${sceneHead}」同一场景内同时出现"上车/进车"与"下车/离开车"——载具移动=位移，上车点与下车点应拆成不同场景（否则转分镜会把上下车做成同一地点）`);
+  }
+}
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
 const isMetaLine = (l) => /^【(画面|运镜|音效|字幕|转场|特效)】/.test(l);
@@ -44,6 +54,11 @@ function gateOneScript(text) {
     run = [];
   };
   let narrativeCount = 0;
+  let sceneHead = null, sceneBuf = [];
+  const flushScene = () => {
+    if (sceneHead) checkVehicleSceneContinuity(sceneHead, sceneBuf, warnings);
+    sceneBuf = [];
+  };
   for (let i = 0; i < rawLines.length; i++) {
     const l = rawLines[i].trim();
     const ln = i + 1;
@@ -52,12 +67,15 @@ function gateOneScript(text) {
       flushRun();
       actCount++;
       const body = l.slice(1).trim();
+      sceneBuf.push(body);
       if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
       if (body.length < 6) warnings.push(`第${ln}行 △太短（${body.length}字）——动作要具体可拍`);
       if (body.length > 60) warnings.push(`第${ln}行 △太长（${body.length}字）——一行一件事，拆开`);
       continue;
     }
-    if (isMetaLine(l) || isSceneHead(l) || isEpTitle(l)) { flushRun(); continue; }
+    if (isSceneHead(l)) { flushRun(); flushScene(); sceneHead = l; continue; }
+    if (isEpTitle(l)) { flushRun(); flushScene(); sceneHead = null; continue; }
+    if (isMetaLine(l)) { flushRun(); sceneBuf.push(l.replace(/^【[^】]*】/, '')); continue; }
     const d = matchDialogue(l);
     if (d) {
       dlgCount++;
@@ -69,6 +87,7 @@ function gateOneScript(text) {
     narrativeCount++;
   }
   flushRun();
+  flushScene();
   const structured = dlgCount + actCount;
   if (narrativeCount >= 30 && structured < narrativeCount * 0.25 && !rawLines.some(l => isSceneHead(l.trim()))) {
     return {
@@ -118,7 +137,7 @@ function cmdHelp() {
 
   校验内容：
     硬伤（挡门）：对白连发段(连续>=3句台词无△) / △写心理活动 / 无台词行 / 无动作行
-    警告（放行）：台词>40字 / △过短过长 / 对白:动作>2:1 / 缺场次头
+    警告（放行）：台词>40字 / △过短过长 / 对白:动作>2:1 / 缺场次头 / 载具上下车未分场景
     另：自动识别小说/散文源材料并提示先改编
 
   改到 GATE_PASS，剧本即达辰屿出片标准格式。
