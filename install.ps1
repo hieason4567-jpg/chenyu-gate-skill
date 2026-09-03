@@ -3,7 +3,7 @@
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-gate 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/hieason4567-jpg/chenyu-gate-skill/main"
-$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs", "scripts/superi_lookup.mjs")
+$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs", "scripts/superi_lookup.mjs", "references/分镜写作守则.md")
 
 $roots = @()
 $roots += Join-Path $env:USERPROFILE ".codex\skills"
@@ -12,10 +12,12 @@ $roots += Join-Path $env:USERPROFILE ".claude\skills"
 $primary = ""
 foreach ($root in $roots) {
   $dest = Join-Path $root "chenyu-gate"
-  New-Item -ItemType Directory -Force (Join-Path $dest "scripts") | Out-Null
+  New-Item -ItemType Directory -Force $dest | Out-Null
   foreach ($f in $files) {
     $target = Join-Path $dest ($f -replace "/", "\")
-    Invoke-WebRequest -UseBasicParsing -Uri "$repo/$f" -OutFile $target
+    New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+    $url = [uri]::EscapeUriString("$repo/$f")
+    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $target
   }
   if (-not $primary) { $primary = $dest }
   Write-Host "  Skill installed -> $dest"
