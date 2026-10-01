@@ -454,6 +454,16 @@ const GATE_TIMELEAK_RE = /\d{1,2}[:：]\d{2}\s*[-~–—至到]\s*\d{1,2}[:：]\
 // 「===== 第04集 =====」「---- EP04 ----」这类被装饰符包着的集号行：客户端拆集不认它，会当成上一集正文的最后一行。
 const GATE_EPSEP_RE = /^[=\-*_—–~]{3,}\s*(?:第\s*[0-9零〇一二三四五六七八九十百]+\s*[集章回]|EP\s*\d{1,4}|Episode\s*\d{1,4})(?![0-9])/i;
 const isSceneHead = (l) => /^\d+-\d+\s+\S/.test(l);
+// 载具进出必须分场景(连续性)：同一场景块内同时出现"上车/进车"与"下车/离开车"→警告。
+// 载具移动=位移，上车点与下车点是不同地点，写在同一场景会让转分镜做成同一地点。
+const VEHICLE_ENTER_RE = /上车|上了车|坐进[^。；;]{0,6}[车轿]|钻进[^。；;]{0,6}[车轿]|登上[^。；;]{0,4}车|爬上车顶|翻上车顶|坐上车顶|翻身坐(在|上)[^。；;]{0,6}车/;
+const VEHICLE_EXIT_RE = /下车|下了车|走下[^。；;]{0,4}车|跳下车|钻出[^。；;]{0,6}[车轿]|离开[^。；;]{0,4}[车轿]/;
+function checkVehicleSceneContinuity(sceneHead, texts, warnings) {
+  const joined = texts.join(' ');
+  if (VEHICLE_ENTER_RE.test(joined) && VEHICLE_EXIT_RE.test(joined)) {
+    warnings.push(`场景「${sceneHead}」同一场景内同时出现"上车/进车"与"下车/离开车"——载具移动=位移，上车点与下车点应拆成不同场景（否则转分镜会把上下车做成同一地点）`);
+  }
+}
 const isEpTitle = (l) => /^第\d+集/.test(l);
 const isActionLine = (l) => l.startsWith('△') || l.startsWith('▲');
 const isMetaLine = (l) => /^【(画面|运镜|音效|字幕|转场|特效)】/.test(l);
@@ -598,6 +608,11 @@ function gateOneScript(text, ctx = newVariantContext()) {
   let narrativeCount = 0;   // 既非台词/△/元信息/场次头的叙述行（小说识别用）
   let inSceneIntro = false;  // 是否处在"场次头之后、首个△/台词之前"（环境描述行允许区）
   const actionSeen = new Map(); // △正文 → 出现行号（重复△检测）
+  let sceneHead = null, sceneBuf = []; // 当前场景的△/画面文字（载具进出连续性检测）
+  const flushScene = () => {
+    if (sceneHead) checkVehicleSceneContinuity(sceneHead, sceneBuf, warnings);
+    sceneBuf = [];
+  };
   for (let i = 0; i < rawLines.length; i++) {
     const l = rawLines[i].trim();
     const ln = i + 1;
@@ -610,6 +625,7 @@ function gateOneScript(text, ctx = newVariantContext()) {
       inSceneIntro = false;
       actCount++;
       const body = l.slice(1).trim();
+      sceneBuf.push(body);
       if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
       if (GATE_TIMECODE_RE.test(body)) errors.push(`第${ln}行 △里写了时间码（${(body.match(GATE_TIMECODE_RE) || [''])[0].trim()}）→ 剧本不写时间码，删掉，直接写可见动作`);
       if (GATE_FILLER_RE.test(body)) errors.push(`第${ln}行 △是万能填充句/占位话（${(body.match(GATE_FILLER_RE) || [''])[0]}）→ 写该时刻具体谁做了什么可见动作（分析表 visible_action 那一列就是素材），不要用空话占位`);
@@ -622,7 +638,10 @@ function gateOneScript(text, ctx = newVariantContext()) {
     }
     // 人物行、画面/镜头描述块：合法结构行，放行不计叙述。
     if (isCharacterListLine(l) || isPictureLine(l)) { flushRun(); continue; }
-    if (isMetaLine(l) || isVariantLine(l) || isSceneHead(l) || isEpTitle(l)) { flushRun(); if (isSceneHead(l)) inSceneIntro = true; continue; }
+    if (isSceneHead(l)) { flushRun(); flushScene(); sceneHead = l; inSceneIntro = true; continue; }
+    if (isEpTitle(l)) { flushRun(); flushScene(); sceneHead = null; continue; }
+    if (isMetaLine(l)) { flushRun(); sceneBuf.push(l.replace(/^【[^】]*】/, '')); continue; }
+    if (isVariantLine(l)) { flushRun(); continue; }
     const d = matchDialogue(l);
     if (d) {
       dlgCount++;
@@ -637,6 +656,7 @@ function gateOneScript(text, ctx = newVariantContext()) {
     narrativeCount++;
   }
   flushRun();
+  flushScene();
   // 小说/散文识别：绝大部分是叙述行、几乎没有剧本结构 → 这是源材料不是剧本，
   // 逐条打补丁方向就错了，应整体改编成剧本格式后再过门。
   const structured = dlgCount + actCount;
