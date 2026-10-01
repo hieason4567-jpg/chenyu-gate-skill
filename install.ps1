@@ -1,9 +1,9 @@
-# 辰屿剧本格式校对（免费版）一行安装（Windows）：
+# 辰屿剧本工具（免费版）一行安装（Windows）：
 #   irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-gate-skill/main/install.ps1 | iex
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-gate 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/hieason4567-jpg/chenyu-gate-skill/main"
-$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs")
+$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs", "scripts/chenyu_pro_cli.mjs", "scripts/net.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs", "scripts/durations.mjs", "scripts/remake.mjs", "scripts/styling_static.json", "scripts/excel_import.mjs", "scripts/storyboard_audit.mjs")
 
 $roots = @()
 $roots += Join-Path $env:USERPROFILE ".codex\skills"
@@ -34,8 +34,7 @@ if ($userPath -notlike "*$binDir*") {
 }
 
 Write-Host ""
-& node $cliPath version
-Write-Host ""
-Write-Host "Install complete. Usage:" -ForegroundColor Green
-Write-Host "  chenyu-gate --file script.txt"
-exit 0
+Write-Host "Install complete." -ForegroundColor Green
+# 使用说明：node 直接写终端（不经过管道，避免 PowerShell 把中文转成乱码）
+& node $cliPath guide
+# 不要 exit：用 irm | iex 运行时 exit 会直接关掉用户的 PowerShell 窗口，看不到安装结果
