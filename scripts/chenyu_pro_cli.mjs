@@ -3,10 +3,12 @@
 // 不消耗平台积分；本 CLI 只做 鉴权/项目壳/正文回传/只读查询/交付。
 // CLI 内不存在任何能触发平台模型生成或扣积分的调用（v2.1.0 起物理移除）。
 // 零依赖，Node 18+。配置存 ~/.codex/chenyu-pro/config.json（KEY/session 掩码显示，绝不写入日志）。
-import './net.mjs'; // 网络层：直连失败自动改走系统代理（须在其它代码之前加载，先取到代理环境变量）
+import { proxyFetch, findSystemProxy } from './net.mjs'; // 网络层：直连失败自动改走系统代理（须在其它代码之前加载，先取到代理环境变量）
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { exec, spawn, spawnSync } from 'node:child_process';
 import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
@@ -16,6 +18,8 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.0 2026-10-03  视频上传前压缩改为硬要求：Skill 自带 ffmpeg（安装时下载，缺了自动补，有系统代理走代理）；每集按时长算码率压到 22MB 以内，
+//                    只降码率不缩分辨率（很长的集降帧率）；没有 ffmpeg 且有文件超过 24MB 时停下不传（不再悄悄传原片）。新命令 ffmpeg [--install]。
 // v2.13.2 2026-10-03  version 顺带查 GitHub 线上最新版，旧版提示重跑安装命令；补齐 2.13.x 更新记录。
 // v2.13.1 2026-10-03  工程改写的造型描述保留 脸部/身材/发型（客户端出图只读描述，截掉会画成同一个发型和脸），缺的用卡片字段补回。
 // v2.13.0 2026-10-01  成片工程改写 remake-*（客户端工程 JSON/xlsx 不重新分镜）；场景道具出图描述；打包客户端同款审核；
@@ -136,7 +140,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.13.2';
+const VERSION = '2.14.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -895,23 +899,146 @@ async function cmdSave() {
 // 只有台词没有画面动作，洗出的剧本乱、改动大（2026-09-13 用户实测反馈）。
 const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'video/x-matroska', '.webm': 'video/webm', '.avi': 'video/x-msvideo', '.m4v': 'video/x-m4v', '.ts': 'video/mp2t' };
 // 上传前压缩到低清分析代理：服务端视频反推只需看清人物/动作/服装，不需要原始高码率。
-// 有 ffmpeg 就先压到 proxyHeight（默认720p，保留音轨供台词/声音识别），上传体积小、超时概率低；
-// 没有 ffmpeg 或压缩失败就传原片。压缩不改视频时长，计费按秒数不变——这一步只省上传带宽，不省积分。
+// 上传前压缩（保留音轨供台词识别）：压缩不改视频时长，计费按秒数不变——这一步只管体积，不省积分。
+// Skill 自带 ffmpeg（v2.14.0）：安装器装完会下载一份到 ~/.codex/chenyu-pro/bin/，Codex 与 Claude Code 共用。
+// 起因：没装 ffmpeg 的机器只打印一行提示就照传原片（2026-10-03 一部 72 集全是原片上传，32MB 的集超过上游 24MB 上限、
+// 语音识别也拉取失败）。带 libx264 的精简版，gzip 后 29MB，不放 GitHub 仓库（国内下载慢、仓库会越来越大）。
+// 下载源按顺序试：先平台域名（CLI 本来就连它），再备用存储；20 秒没数据就换下一个源，不傻等（实测国内直连备用存储会卡在 30%）。
+const BUNDLED_FFMPEG = {
+  urls: [
+    'https://chenyu.pumpumai.com/downloads/chenyu-ffmpeg-6.1.1-win64.exe.gz',
+    'https://pub-a98cf3718f684ce8b752168564943590.r2.dev/updates/runtime/chenyu-skill/chenyu-ffmpeg-6.1.1-win64.exe.gz',
+  ],
+  gzSha256: 'f5ae838ff0a14e5781ffef25d44e275c19e9852ca1afece4159a2d28d70e789c',
+  exeSha256: '04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00',
+  exeSize: 82797568,
+};
+const bundledFfmpegPath = () => path.join(CONFIG_DIR, 'bin', 'ffmpeg.exe');
+const runsFfmpeg = (bin) => { try { return spawnSync(bin, ['-version'], { windowsHide: true }).status === 0; } catch { return false; } };
 function resolveFfmpeg() {
-  const cands = [process.env.CHENYU_FFMPEG, 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe'].filter(Boolean);
-  for (const c of cands) {
-    try { const r = spawnSync(c, ['-version'], { windowsHide: true }); if (r.status === 0) return c; } catch { /* 下一个候选 */ }
-  }
+  const cands = [process.env.CHENYU_FFMPEG, bundledFfmpegPath(), 'ffmpeg', 'C:\\ffmpeg\\bin\\ffmpeg.exe', 'C:\\ffmpeg-6.1.1\\bin\\ffmpeg.exe'].filter(Boolean);
+  for (const c of cands) if (runsFfmpeg(c)) return c;
   return null;
 }
-function compressVideoProxy(ffmpeg, src, dst, height) {
+const sha256OfFile = (file) => new Promise((resolve, reject) => {
+  const hash = crypto.createHash('sha256');
+  fs.createReadStream(file).on('data', (d) => hash.update(d)).on('end', () => resolve(hash.digest('hex'))).on('error', reject);
+});
+// 没有可用的 ffmpeg 时下载自带的那份（下载→校验→解压→再校验→试运行）。返回可用的 ffmpeg 路径，装不上返回 null 并说明原因。
+async function ensureFfmpeg({ quiet = false } = {}) {
+  const existing = resolveFfmpeg();
+  if (existing) return existing;
+  if (process.platform !== 'win32') { if (!quiet) console.log('  自带 ffmpeg 只有 Windows 版；本机请自行安装 ffmpeg（或设 CHENYU_FFMPEG 指向它）。'); return null; }
+  const target = bundledFfmpegPath();
+  const gzPath = `${target}.gz.part`;
+  // 从一个源下载到 gzPath；连接或中途 20 秒没数据就中断（抛错给调用方换下一种走法）。
+  // viaProxy=true 经系统代理下（国内直连境外存储又慢又会卡死，有代理必须先走代理）。
+  const downloadFrom = async (url, viaProxy) => {
+    const controller = new AbortController();
+    let timer = setTimeout(() => controller.abort(), 20000);
+    const touch = () => { clearTimeout(timer); timer = setTimeout(() => controller.abort(), 20000); };
+    let got = 0, shown = -1;
+    const progress = (n, total) => {
+      touch();
+      got += n;
+      const pct = total ? Math.floor((got / total) * 4) * 25 : -1;
+      if (pct > shown && pct < 100) { shown = pct; console.log(`    ${pct}%`); }
+    };
+    try {
+      if (viaProxy) {
+        const res = await proxyFetch(url, { signal: controller.signal, onData: progress });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        fs.writeFileSync(gzPath, Buffer.from(await res.arrayBuffer()));
+      } else {
+        const res = await fetch(url, { signal: controller.signal });
+        if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+        const total = Number(res.headers.get('content-length') || 0);
+        const out = fs.createWriteStream(gzPath);
+        try {
+          for await (const chunk of res.body) {
+            progress(chunk.length, total);
+            if (!out.write(chunk)) await new Promise((r) => out.once('drain', r));
+          }
+        } finally {
+          await new Promise((resolve) => out.end(resolve));
+        }
+      }
+      if ((await sha256OfFile(gzPath)) !== BUNDLED_FFMPEG.gzSha256) throw new Error('下载的文件校验不一致');
+    } catch (error) {
+      throw new Error(controller.signal.aborted ? '20 秒没有数据' : String(error?.message || error));
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    console.log('  正在下载自带的 ffmpeg（约 29MB，只下一次）…');
+    let lastError = '';
+    let ok = false;
+    // 有系统代理就先经代理把两个源都试一遍，再直连；没有代理只直连
+    const hasProxy = Boolean(findSystemProxy());
+    const plan = [...(hasProxy ? BUNDLED_FFMPEG.urls.map((url) => ({ url, viaProxy: true })) : []), ...BUNDLED_FFMPEG.urls.map((url) => ({ url, viaProxy: false }))];
+    if (hasProxy) console.log('    检测到系统代理，经代理下载');
+    for (const [index, step] of plan.entries()) {
+      try { await downloadFrom(step.url, step.viaProxy); ok = true; break; } catch (error) {
+        lastError = String(error?.message || error);
+        try { fs.rmSync(gzPath, { force: true }); } catch { /* ignore */ }
+        if (index < plan.length - 1) console.log(`    这一路不通（${lastError.slice(0, 40)}），换下一路${plan[index + 1].viaProxy ? '' : '（直连）'}…`);
+      }
+    }
+    if (!ok) throw new Error(lastError || '下载失败');
+    const tmpExe = `${target}.part`;
+    await new Promise((resolve, reject) => {
+      const gunzip = zlib.createGunzip();
+      const w = fs.createWriteStream(tmpExe);
+      fs.createReadStream(gzPath).on('error', reject).pipe(gunzip).on('error', reject).pipe(w).on('error', reject).on('finish', resolve);
+    });
+    if ((await sha256OfFile(tmpExe)) !== BUNDLED_FFMPEG.exeSha256) throw new Error('解压后的文件校验不一致');
+    fs.rmSync(target, { force: true });
+    fs.renameSync(tmpExe, target);
+    fs.rmSync(gzPath, { force: true });
+    if (!runsFfmpeg(target)) throw new Error('装好的 ffmpeg 无法运行');
+    console.log(`  ✓ ffmpeg 已就绪：${target}`);
+    return target;
+  } catch (error) {
+    for (const f of [gzPath, `${target}.part`]) { try { fs.rmSync(f, { force: true }); } catch { /* ignore */ } }
+    if (!quiet) console.log(`  ✗ 自带 ffmpeg 下载失败：${String(error?.message || error).slice(0, 80)}（可重跑 chenyu-pro ffmpeg --install，或自行安装 ffmpeg 后设 CHENYU_FFMPEG）`);
+    return null;
+  }
+}
+async function cmdFfmpeg() {
+  const found = flag('install') ? await ensureFfmpeg() : resolveFfmpeg();
+  if (found) console.log(`ffmpeg 可用：${found}${flag('install') ? '' : '（视频上传前会自动压缩）'}`);
+  else { console.log('没有可用的 ffmpeg。运行 chenyu-pro ffmpeg --install 下载自带的那份。'); process.exitCode = 1; }
+}
+// 上游视频模型单个文件上限 24MB（超过的集分析结果是空的），语音识别拉大文件也容易失败 → 每集压到 22MB 以内。
+const VIDEO_UPLOAD_LIMIT_BYTES = 24 * 1024 * 1024;
+const VIDEO_TARGET_BYTES = 22 * 1024 * 1024;
+// 用 ffmpeg 自己读时长（不依赖 ffprobe，自带的包里只有 ffmpeg）
+function ffmpegDurationSeconds(ffmpeg, file) {
+  try {
+    const r = spawnSync(ffmpeg, ['-hide_banner', '-i', file], { windowsHide: true, encoding: 'utf8' });
+    const m = String(r.stderr || '').match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
+  } catch { return 0; }
+}
+// 按时长算码率，保证压完 ≤ 22MB。**只压码率，分辨率永远不动**：缩分辨率后竖排名牌小字会糊到认错字
+// （v2.9.0 已踩过，用户 2026-10-03 再次明确）。很长的集码率不够时改降帧率（字的清晰度不变，只是没那么流畅）。
+// 时长读不到时退回「CRF28 + 1.5Mbps 封顶」。scale<1 时在算出的码率上再打折（压完仍超限时重压用）。
+function videoCompressArgs(src, dst, durationSec, scale = 1) {
+  const audioK = 64;
+  if (!(durationSec > 0)) return ['-y', '-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-maxrate', '1500k', '-bufsize', '3000k', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
+  const budgetK = Math.floor((VIDEO_TARGET_BYTES * 8) / durationSec / 1000 * 0.97); // 留 3% 给封装开销
+  const videoK = Math.max(200, Math.floor(Math.min(1500, budgetK - audioK) * scale));
+  const a = ['-y', '-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', `${videoK}k`, '-maxrate', `${videoK}k`, '-bufsize', `${videoK * 2}k`];
+  if (videoK < 700) a.push('-r', videoK < 350 ? '10' : '15');
+  a.push('-c:a', 'aac', '-b:a', `${audioK}k`, '-movflags', '+faststart', dst);
+  return a;
+}
+function compressVideoProxy(ffmpeg, src, dst, durationSec = 0, scale = 1) {
   return new Promise((resolve, reject) => {
     try { fs.rmSync(dst, { force: true }); } catch { /* ignore */ }
-    // 只降码率、不缩分辨率（原来按高缩成 404×720，竖排小字名牌糊到认错字）。height 参数仅为兼容旧调用，不再使用。
-    // 码率封顶 1.5Mbps；压完不比原片小的，由调用方直接传原片。
-    void height;
-    const a = ['-y', '-i', src, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '28', '-maxrate', '1500k', '-bufsize', '3000k', '-c:a', 'aac', '-b:a', '96k', '-movflags', '+faststart', dst];
-    const child = spawn(ffmpeg, a, { windowsHide: true });
+    const child = spawn(ffmpeg, videoCompressArgs(src, dst, durationSec, scale), { windowsHide: true });
     let err = '';
     child.stderr?.on('data', (d) => { err += d.toString(); if (err.length > 4000) err = err.slice(-4000); });
     child.on('error', reject);
@@ -931,7 +1058,9 @@ function probeDurationSeconds(file) {
       if (r.status === 0) { const d = Number(String(r.stdout || '').trim()); if (d > 0) return d; }
     } catch { /* 试下一个候选 */ }
   }
-  return 0;
+  // 没有 ffprobe 时用 ffmpeg 自己读（自带的包里只有 ffmpeg）
+  const ffmpeg = resolveFfmpeg();
+  return ffmpeg ? ffmpegDurationSeconds(ffmpeg, file) : 0;
 }
 
 // 查余额但不中断流程（用于对比实际扣除），取不到返回 null。
@@ -1073,6 +1202,18 @@ async function cmdVideoAnalyze() {
   const urls = arg('video-url', '').split(',').map((s) => s.trim()).filter((s) => /^https?:\/\//i.test(s));
   if (!files.length && !urls.length) die('缺 --video-file <本地.mp4> 或 --video-url <链接>（多个用英文逗号分隔，可混用）');
   for (const f of files) if (!fs.existsSync(f)) die('视频文件不存在: ' + f);
+  // 压缩是硬要求（v2.14.0），放在报价和建项目之前：读时长报价要用 ffmpeg，装不上也不会留下空项目。
+  // 没有 ffmpeg 先下载自带的那份；仍没有且有文件超过 24MB 就停，不再悄悄传原片。
+  const ffmpeg = flag('no-compress') ? null : (files.length ? await ensureFfmpeg() : resolveFfmpeg());
+  const oversized = files.filter((f) => fs.statSync(f).size > VIDEO_UPLOAD_LIMIT_BYTES);
+  if (!ffmpeg && oversized.length) {
+    die(`有 ${oversized.length} 个视频超过 24MB（上游单个文件上限，超过的集分析结果会是空的），必须先压缩再传：\n` +
+      oversized.slice(0, 8).map((f) => `    ${path.basename(f)}  ${(fs.statSync(f).size / 1048576).toFixed(1)}MB`).join('\n') + (oversized.length > 8 ? `\n    … 另有 ${oversized.length - 8} 个` : '') +
+      `\n  本机没有可用的 ffmpeg${flag('no-compress') ? '（你加了 --no-compress）' : '，自带的那份也没下载成功'}。` +
+      `\n  处理：重跑 chenyu-pro ffmpeg --install；或自行安装 ffmpeg 后设环境变量 CHENYU_FFMPEG 指向 ffmpeg.exe。本次没有上传、没有扣分。`);
+  }
+  if (ffmpeg) console.log("  上传前压缩：只降码率、不缩分辨率，每集压到 22MB 以内（计费按时长不变）");
+  else if (files.length) console.log('  没有 ffmpeg，本批视频都在 24MB 以内，直接传原片。');
 
   // ⓪ 同一部剧只用一个项目：--project 追加到已有项目；集号按文件名。
   const projectFragment = arg('project', '');
@@ -1184,11 +1325,7 @@ async function cmdVideoAnalyze() {
   const saveCache = () => {
     try { fs.mkdirSync(cacheDir, { recursive: true }); fs.writeFileSync(cachePath, JSON.stringify(uploadCache, null, 1)); } catch {}
   };
-  const proxyHeight = Math.max(240, Number(arg('proxy-height', '720')) || 720);
-  const ffmpeg = flag('no-compress') ? null : resolveFfmpeg();
   const proxyDir = path.join(CONFIG_DIR, 'proxy');
-  if (ffmpeg) console.log('  上传前降码率（分辨率不变，名牌小字要看清；压完不比原片小就传原片；计费按时长不变；--no-compress 关）');
-  else if (files.length && !flag('no-compress')) console.log('  提示: 未找到 ffmpeg → 传原始视频。装 ffmpeg（或设 CHENYU_FFMPEG）后会自动压缩再传，弱网更稳。');
   const concurrency = Math.max(1, Math.min(4, Number(arg('upload-concurrency', '2')) || 2));
   const maxAttempts = Math.max(1, Number(arg('upload-retries', '4')) || 4);
   const uploaded = [];
@@ -1201,7 +1338,7 @@ async function cmdVideoAnalyze() {
     const stat = fs.statSync(fp);
     const size = stat.size;
     // 压缩参数也进缓存键：画质规则改了（v2.9.0 不缩分辨率、只降码率）就重新压、重新传，不复用旧的低清上传
-    const cacheKey = `${path.resolve(fp)}|${size}|${Math.round(stat.mtimeMs)}|${ffmpeg ? 'fullres-crf28-1500k' : 'orig'}`;
+    const cacheKey = `${path.resolve(fp)}|${size}|${Math.round(stat.mtimeMs)}|${ffmpeg ? 'cap22mb-v1' : 'orig'}`;
     if (uploadCache[cacheKey]?.client_media_path) {
       uploaded[i] = uploadCache[cacheKey];
       console.log(`  ✓ 已传过，跳过 ${name}`);
@@ -1216,15 +1353,24 @@ async function cmdVideoAnalyze() {
         fs.mkdirSync(proxyDir, { recursive: true });
         // 临时文件名必须带进程号：同时开两个窗口压缩同一个视频时，旧命名会让两个 ffmpeg 写同一个文件，
         // 上传的是写坏的视频，上游判「参数无效」（2026-09-30 联调实测：两条路同时跑，其中一路的第 2 集连续失败）。
-        const tmp = path.join(proxyDir, `p${process.pid}_${Date.now().toString(36)}_${i}_${proxyHeight}_${name.replace(/[^\w.\-]+/g, '_')}.mp4`);
-        await compressVideoProxy(ffmpeg, fp, tmp, proxyHeight);
-        const tsize = fs.statSync(tmp).size;
-        if (tsize > 0 && tsize < size) { sendPath = tmp; sendSize = tsize; proxyTmp = tmp; }
+        const tmp = path.join(proxyDir, `p${process.pid}_${Date.now().toString(36)}_${i}_${name.replace(/[^\w.\-]+/g, '_')}.mp4`);
+        const durationSec = ffmpegDurationSeconds(ffmpeg, fp);
+        await compressVideoProxy(ffmpeg, fp, tmp, durationSec);
+        let tsize = fs.statSync(tmp).size;
+        // 码率控制有误差：压完仍超过 23.5MB 就按超出的比例再压一次
+        if (tsize > VIDEO_UPLOAD_LIMIT_BYTES - 512 * 1024) {
+          await compressVideoProxy(ffmpeg, fp, tmp, durationSec, Math.min(0.85, (VIDEO_TARGET_BYTES / tsize) * 0.95));
+          tsize = fs.statSync(tmp).size;
+        }
+        // 压完更小才用压缩版；原片本来就在上限内且压完没变小的，传原片
+        if (tsize > 0 && (tsize < size || size > VIDEO_UPLOAD_LIMIT_BYTES)) { sendPath = tmp; sendSize = tsize; proxyTmp = tmp; }
         else { try { fs.rmSync(tmp, { force: true }); } catch { /* ignore */ } }
       } catch (error) {
-        console.log(`  … ${name} 压缩失败(${String(error?.message || error).slice(0, 40)})，改传原片`);
+        if (size > VIDEO_UPLOAD_LIMIT_BYTES) { failed.push({ name, error: `压缩失败且原片 ${(size / 1048576).toFixed(1)}MB 超过 24MB 上限：${String(error?.message || error).slice(0, 60)}` }); return; }
+        console.log(`  … ${name} 压缩失败(${String(error?.message || error).slice(0, 40)})，原片在 24MB 以内，改传原片`);
       }
     }
+    if (sendSize > VIDEO_UPLOAD_LIMIT_BYTES) { failed.push({ name, error: `压缩后仍有 ${(sendSize / 1048576).toFixed(1)}MB，超过 24MB 上限（这一集太长，请先剪成更短的段）` }); return; }
     const body = fs.readFileSync(sendPath);
     // 超时按体积放宽：至少 3 分钟，按 50KB/s 最慢速度估算
     const timeoutMs = Math.max(180000, Math.ceil(sendSize / 50000) * 1000);
@@ -1262,7 +1408,7 @@ async function cmdVideoAnalyze() {
   }));
   if (failed.length) {
     for (const item of failed) console.log(`  ✗ ${item.name}：${item.error}`);
-    die(`${failed.length} 个视频没传上去（网络到存储不稳定），本次没有提交分析、没有扣分。\n` +
+    die(`${failed.length} 个视频没传上去（原因见上），本次没有提交分析、没有扣分。\n` +
       `  已传成功的 ${uploaded.filter(Boolean).length} 个已记录，重跑时会跳过。请用同一条命令加 --project ${pid.slice(-8)} 重跑，\n` +
       `  只会补传没传上的；网络持续超时可换网络（如手机热点）或加 --upload-concurrency 1。`);
   }
@@ -2157,7 +2303,7 @@ const PRO_GUIDE_SECTIONS = [
     notes: ['之后在 Codex / Claude Code 里用大白话说需求，命令由 Agent 自己跑，你不用记命令',
       '拿不准手上的文件该怎么处理，就说「看看这个文件该怎么用」'] },
   { key: '视频', title: '一、视频反推剧本 —— 手上只有成片视频',
-    notes: ['计费：每 240 秒视频 30 积分（不足按一段算），Agent 先报价，你同意才扣；后面写剧本不扣积分'],
+    notes: ['计费：每 240 秒视频 30 积分（不足按一段算），Agent 先报价，你同意才扣；后面写剧本不扣积分', '上传前自动压缩：只降码率、不缩分辨率，每集压到 22MB 以内；Skill 自带 ffmpeg，不用自己装'],
     scenes: [
       { name: '整部剧 1:1 还原', say: '把 D:\\短剧\\霸总 里第1-30集视频反推成剧本，1:1 还原，台词保留原句',
         get: '分集剧本 + 全局资产清单 + 形象表.json + 交付审核报告',
@@ -2298,6 +2444,7 @@ function cmdHelp() {
   chenyu-pro login --username <账号> --password <密码>     密码登录你的账号
   chenyu-pro key set <积分KEY> | key show                  仅绑积分 KEY（快速免密，但走独立身份）
   chenyu-pro guide                                         使用说明（带实例，装完自动显示）
+  chenyu-pro ffmpeg [--install]                            查看 / 下载自带的 ffmpeg（视频上传前压缩用）
   chenyu-pro credits                                       查用户名·余额
   【Agent 写作模式（默认）：写作由你的 Agent 完成，不消耗平台积分，平台只做鉴权与交付】
   chenyu-pro auth                                          鉴权门——Agent 动笔前必须通过(输出 AUTH_OK)
@@ -2343,7 +2490,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);

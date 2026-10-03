@@ -104,7 +104,8 @@ export async function proxyFetch(input, init = {}, proxyUrl = findSystemProxy())
     if (signal) { if (signal.aborted) return onAbort(); signal.addEventListener('abort', onAbort, { once: true }); }
     req.on('response', (res) => {
       const chunks = [];
-      res.on('data', (c) => chunks.push(c));
+      // init.onData：大文件下载时让调用方知道还有数据在来（做停滞检测/进度）
+      res.on('data', (c) => { chunks.push(c); if (typeof init.onData === 'function') init.onData(c.length, Number(res.headers['content-length'] || 0)); });
       res.on('end', () => {
         signal?.removeEventListener('abort', onAbort);
         const h = new Headers();
