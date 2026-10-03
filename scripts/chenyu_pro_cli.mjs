@@ -18,8 +18,9 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.2 2026-10-03  自带 ffmpeg 的下载源只用对象存储（不再从平台服务器下，那台是渠道服务器）。
 // v2.14.1 2026-10-03  批量视频分析：有集没分析成功时明确拦住（全部集拿到结果才交付），给出只补缺集的命令。
-//                    平台同步：分析并发默认 12、临时性失败追加重试 3 轮、语音识别失败重试 3 次。
+//                    平台同步：分析并发默认 64、临时性失败追加重试 3 轮、语音识别失败重试 3 次。
 // v2.14.0 2026-10-03  视频上传前压缩改为硬要求：Skill 自带 ffmpeg（安装时下载，缺了自动补，有系统代理走代理）；每集按时长算码率压到 22MB 以内，
 //                    只降码率不缩分辨率（很长的集降帧率）；没有 ffmpeg 且有文件超过 24MB 时停下不传（不再悄悄传原片）。新命令 ffmpeg [--install]。
 // v2.13.2 2026-10-03  version 顺带查 GitHub 线上最新版，旧版提示重跑安装命令；补齐 2.13.x 更新记录。
@@ -142,7 +143,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.1';
+const VERSION = '2.14.2';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -905,10 +906,10 @@ const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'vi
 // Skill 自带 ffmpeg（v2.14.0）：安装器装完会下载一份到 ~/.codex/chenyu-pro/bin/，Codex 与 Claude Code 共用。
 // 起因：没装 ffmpeg 的机器只打印一行提示就照传原片（2026-10-03 一部 72 集全是原片上传，32MB 的集超过上游 24MB 上限、
 // 语音识别也拉取失败）。带 libx264 的精简版，gzip 后 29MB，不放 GitHub 仓库（国内下载慢、仓库会越来越大）。
-// 下载源按顺序试：先平台域名（CLI 本来就连它），再备用存储；20 秒没数据就换下一个源，不傻等（实测国内直连备用存储会卡在 30%）。
+// 下载源放在更新分发用的对象存储上（不放渠道服务器，不占它的带宽）。有系统代理先走代理（国内直连境外存储又慢又会卡死），
+// 20 秒没数据就换下一种走法。要加备用源往 urls 里追加即可。
 const BUNDLED_FFMPEG = {
   urls: [
-    'https://chenyu.pumpumai.com/downloads/chenyu-ffmpeg-6.1.1-win64.exe.gz',
     'https://pub-a98cf3718f684ce8b752168564943590.r2.dev/updates/runtime/chenyu-skill/chenyu-ffmpeg-6.1.1-win64.exe.gz',
   ],
   gzSha256: 'f5ae838ff0a14e5781ffef25d44e275c19e9852ca1afece4159a2d28d70e789c',
