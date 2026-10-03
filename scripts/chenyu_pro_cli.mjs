@@ -18,6 +18,8 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.4 2026-10-04  集号取错修复：「9月15日-2.mp4」这类带日期前缀的文件名以前每个都被取成第 9 集，补失败集时被编到最后（EP072–EP088）。
+//                    现在末尾的 -N 优先；追加到已有项目却取不到集号、而项目里还有缺集时停下不传；新参数 --episodes 2,3,5 直接指定集号。
 // v2.14.3 2026-10-03  自带 ffmpeg 下载源加泉州节点（国内直连几秒下完，不用代理），对象存储做备用。
 // v2.14.2 2026-10-03  自带 ffmpeg 的下载源只用对象存储（不再从平台服务器下，那台是渠道服务器）。
 // v2.14.1 2026-10-03  批量视频分析：有集没分析成功时明确拦住（全部集拿到结果才交付），给出只补缺集的命令。
@@ -144,7 +146,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.3';
+const VERSION = '2.14.4';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1085,13 +1087,15 @@ async function pointsBalanceSafe() {
   } catch { return null; }
 }
 
-// 从文件名取集号：第34集.mp4 / EP34 / E034 / 34.mp4 / 某剧-34.mp4；取不到返回 0。
+// 从文件名取集号：第34集.mp4 / EP34 / E034 / 某剧-34.mp4 / 34.mp4；取不到返回 0。
+// 末尾的「-34」优先于开头的数字：「9月15日-2.mp4」这类带日期前缀的名字，开头的 9 是日期不是集号
+// （2026-10-04 实例：整部剧每个文件都被取成第 9 集）。开头数字后面紧跟 年/月/日/号 的也不当集号。
 function episodeNumberFromName(name) {
   const base = path.basename(String(name || ''), path.extname(String(name || '')));
   const match = base.match(/第\s*0*(\d{1,4})\s*[集话話]/)
     || base.match(/(?:^|[^a-z])(?:ep|e)[\s_-]*0*(\d{1,4})(?!\d)/i)
-    || base.match(/^0*(\d{1,4})(?!\d)/)
-    || base.match(/[\s_\-·.]0*(\d{1,3})$/);
+    || base.match(/[\s_\-·.]0*(\d{1,3})$/)
+    || base.match(/^0*(\d{1,4})(?![\d年月日号])/);
   const n = match ? Number(match[1]) : 0;
   return n > 0 && n < 2000 ? n : 0;
 }
@@ -1250,9 +1254,28 @@ async function cmdVideoAnalyze() {
       } catch { /* 读不到按空 */ }
     }
   }
-  const parsedNumbers = files.map((f) => episodeNumberFromName(f));
+  // 集号：--episodes 2,3,5（按 --video-file 的顺序一一对应）最优先；否则从文件名取。
+  const explicitEpisodes = arg('episodes', '').split(',').map((s) => Number(String(s).trim())).filter((n) => Number.isInteger(n) && n > 0);
+  if (arg('episodes', '') && (explicitEpisodes.length !== files.length || new Set(explicitEpisodes).size !== explicitEpisodes.length)) {
+    die(`--episodes 要和 --video-file 一一对应：给了 ${files.length} 个视频、${explicitEpisodes.length} 个不重复的集号`);
+  }
+  const parsedNumbers = explicitEpisodes.length ? explicitEpisodes : files.map((f) => episodeNumberFromName(f));
   const useFileNumbers = files.length > 0 && parsedNumbers.every((n) => n > 0) && new Set(parsedNumbers).size === parsedNumbers.length;
   const existingMax = existingEpisodes.reduce((max, id) => Math.max(max, Number(String(id).replace(/\D/g, '')) || 0), 0);
+  // 追加到已有项目但集号取不到：以前会悄悄接在最后一集后面顺序编号——补失败集时就编错位置
+  // （2026-10-04 实例：文件名「9月15日-2.mp4」，补第 2、3、5…集被编成 EP072–EP088）。有缺集/失败集时必须明确集号。
+  if (target && files.length && !useFileNumbers) {
+    const have = new Set(existingEpisodes.map((id) => Number(String(id).replace(/\D/g, '')) || 0));
+    const gaps = [];
+    for (let n = 1; n <= existingMax; n += 1) if (!have.has(n)) gaps.push(n);
+    const missing = [...new Set([...gaps, ...failedEpisodes.map((id) => Number(String(id).replace(/\D/g, '')) || 0)])].filter((n) => n > 0).sort((a, b) => a - b);
+    if (missing.length) {
+      die(`从文件名取不到集号（取到的是：${files.map((f, i) => `${path.basename(f)}→${parsedNumbers[i] || '无'}`).slice(0, 6).join('，')}${files.length > 6 ? ' …' : ''}），\n` +
+        `而项目《${target.title}》里还有集没有分析结果：第 ${missing.slice(0, 30).join('、')} 集。\n` +
+        `  补这些集请写明集号（和 --video-file 的顺序一一对应）：--episodes ${missing.slice(0, Math.min(files.length, 30)).join(',')}\n` +
+        `  本次没有上传、没有扣分。`);
+    }
+  }
   if (useFileNumbers && !target && Math.min(...parsedNumbers) > 1 && !flag('new-series')) {
     die(`文件名看起来是第 ${Math.min(...parsedNumbers)} 集起，不是从第 1 集开始。\n` +
       '同一部剧必须放在同一个项目里（否则每集各认各的人，角色重复、对不上）：\n' +
@@ -1495,7 +1518,7 @@ async function cmdVideoAnalyze() {
   if (partial) {
     // 全部集都拿到结果才交付（v2.14.1）：平台已对临时性失败追加重试过，仍缺的集只补这几集，已成功的不会重复扣分。
     console.log(`⛔ 还有集没分析成功：${partial}\n  全部集都拿到分析结果才能往下写、才能交付——不要拿不完整的分析稿写剧本，也不要跳过缺的集。\n` +
-      `  补分析（只传缺的那几集，已成功的集不会重复扣分）：\n    chenyu-pro video-analyze --project ${pid.slice(-8)} --video-file <缺的集.mp4,逗号分隔> --yes\n` +
+      `  补分析（只传缺的那几集，已成功的集不会重复扣分）：\n    chenyu-pro video-analyze --project ${pid.slice(-8)} --video-file <缺的集.mp4,逗号分隔> --episodes <对应集号,逗号分隔> --yes\n` +
       `  补了仍失败，把上面的缺集清单原样告诉用户，由平台核实。`);
     process.exitCode = 2;
   }
