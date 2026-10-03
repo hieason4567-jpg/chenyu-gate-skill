@@ -132,7 +132,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.13.0';
+const VERSION = '2.13.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2077,6 +2077,7 @@ async function cmdRemakeApply() {
   rm.rebuildAdaptationFromChapters(original, project);
   const chars = fs.existsSync(path.join(unitDir, rm.REMAKE_CHAR_FILE)) ? JSON.parse(fs.readFileSync(path.join(unitDir, rm.REMAKE_CHAR_FILE), 'utf8')) : [];
   const charRes = rm.applyCharacters(project, chars);
+  const identityFixed = rm.ensureIdentityInDescriptions(project);
   const sceneEdits = rm.applySceneMapEdits(project, map.sceneMapEdits);
   const cueSwaps = rm.swapVoiceCues(project, units, charRes.voiceSwaps);
   rm.clearGenerated(project);
@@ -2113,6 +2114,7 @@ async function cmdRemakeApply() {
   const out = path.resolve(arg('out', path.join(dir, `${(project.title || 'remake').replace(/[\\/:*?"<>|]/g, '_')}.json`)));
   fs.writeFileSync(out, JSON.stringify(project), 'utf8');
   console.log(`✓ 补丁：${patched.changedUnits} 个单元 ${patched.changedLines} 行；换性别形象 ${chars.filter((e) => e.new?.styleDescription).length}/${chars.length} 个已落；台词音色括注替换 ${cueSwaps} 处；旧成片已清；参考图补 ${img.filled} 张${img.missing ? `（${img.missing} 张本机打不开，导入后需重出）` : ''}`);
+  if (identityFixed.length) console.log(`✓ 造型描述补回 脸部/身材/发型 ${identityFixed.length} 张卡（客户端出图只读描述，缺这几段会画成同一个发型和脸；这些卡导入后重出角色图）`);
   const all = [...patched.issues, ...charRes.issues, ...issues, ...auditNotes.map((x) => `造型审核不通过 ${x}`)];
   for (const x of all.slice(0, 40)) console.log('  ✗ ' + x);
   if (all.length > 40) console.log(`  … 另有 ${all.length - 40} 处`);

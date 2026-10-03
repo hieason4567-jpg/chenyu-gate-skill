@@ -319,6 +319,27 @@ export function charTemplate(project, map, existing = []) {
   return rows;
 }
 
+/**
+ * 造型卡的 description 缺 脸部/身材/发型 时，用卡片自己的 face/body/hair 字段补到描述最前面（只拼接卡上已有的文字，不改写）。
+ * 原因：客户端出图（buildNormalizedCharacterAssetPrompt）只读 description；只有「发色/主色调/部件配色」的描述
+ * 出图时没有发型、脸型、身材，同性别角色会画成同一个默认发型和脸。旧版客户端造型和旧版 remake 都产出过这种卡。
+ */
+const IDENTITY_FIELDS = [['脸部', 'face'], ['身材', 'body'], ['发型', 'hair']];
+const knownText = (v) => { const t = String(v || '').replace(/\s+/g, ' ').trim(); return t && !/^(未知|unknown|无|-)$/i.test(t) ? t : ''; };
+export function ensureIdentityInDescriptions(project) {
+  const fixed = [];
+  for (const c of project.characters || []) {
+    if (c.appearancePromptSource !== 'characterStylingAgent') continue;
+    const d = String(c.description || '').trim();
+    if (!d || /(脸部|身材|发型)\s*[:：]/.test(d)) continue;
+    const head = IDENTITY_FIELDS.map(([label, key]) => (knownText(c[key]) ? `${label}：${knownText(c[key]).replace(/[。；;]+$/u, '')}` : '')).filter(Boolean);
+    if (!head.length) continue;
+    c.description = `${head.join('。')}。${d}`;
+    fixed.push(c.name);
+  }
+  return fixed;
+}
+
 /** 把 Agent 写好的新造型落到角色卡（字段按客户端造型产出的格式拆），删旧参考图让客户端重出 */
 export function applyCharacters(project, entries) {
   const issues = [];
@@ -372,10 +393,13 @@ export function applyCharacters(project, entries) {
     const g = e.newGender === '男' ? 'male' : e.newGender === '女' ? 'female' : '';
     const desc = String(n.styleDescription).trim();
     const fromColor = desc.indexOf('发色');
+    // description 必须是整段（含 脸部/身材/发型）：客户端出图只读 description，不读 hair/face/body 字段，
+    // 截掉身份段 = 出图没有发型和脸型，同性别角色全画成同一个默认发型和脸。全局角色定义那一行仍只放配色段。
+    const colorPart = fromColor >= 0 ? desc.slice(fromColor) : desc;
     const fields = {
       gender: e.swapped ? e.newGender : (c.gender || e.newGender), age: sectionOf(desc, '年龄段') || c.age, hair: sectionOf(desc, '发型') || c.hair, face: sectionOf(desc, '脸部') || c.face,
       body: sectionOf(desc, '身材') || c.body, clothing: sectionOf(desc, '服饰类型') || c.clothing,
-      description: fromColor >= 0 ? desc.slice(fromColor) : desc,
+      description: desc,
       appearanceFeatures: n.appearanceFeatures || '', shortDescription: n.shortDescription || '',
       voice: n.voice || '', voiceRefDescription: n.voiceRefDescription || '', ttsProvider: 'Doubao',
       doubaoVoiceId: n.doubaoVoiceId || '', doubaoVoiceModel: n.doubaoVoiceModel || 'seed-tts-2.0', doubaoVoiceSpeed: n.doubaoVoiceSpeed ?? 1,
@@ -392,7 +416,7 @@ export function applyCharacters(project, entries) {
     const ap = (project.assetBible?.appearances || []).find((a) => a.characterTag === e.tag);
     if (ap) Object.assign(ap, { visibleDefinition: fields.appearanceFeatures || ap.visibleDefinition, ...(g ? { assetIndex: { ...(ap.assetIndex || {}), genderClass: g } } : {}), ...(n.state ? { stateLabel: n.state } : {}) });
     // 全局角色定义：这一行换成新造型的配色段
-    if (typeof project.globalRefs === 'string') project.globalRefs = project.globalRefs.split('\n').map((l) => (l.startsWith(`${e.tag}:`) ? `${e.tag}: ${fields.description}` : l)).join('\n');
+    if (typeof project.globalRefs === 'string') project.globalRefs = project.globalRefs.split('\n').map((l) => (l.startsWith(`${e.tag}:`) ? `${e.tag}: ${colorPart}` : l)).join('\n');
   }
   for (const r of project.assetBible?.roles || []) {
     const looks = (entries || []).filter((e) => e.swapped && (r.aliases || []).includes(e.tag));
