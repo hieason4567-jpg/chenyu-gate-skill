@@ -18,6 +18,8 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.1 2026-10-03  批量视频分析：有集没分析成功时明确拦住（全部集拿到结果才交付），给出只补缺集的命令。
+//                    平台同步：分析并发默认 12、临时性失败追加重试 3 轮、语音识别失败重试 3 次。
 // v2.14.0 2026-10-03  视频上传前压缩改为硬要求：Skill 自带 ffmpeg（安装时下载，缺了自动补，有系统代理走代理）；每集按时长算码率压到 22MB 以内，
 //                    只降码率不缩分辨率（很长的集降帧率）；没有 ffmpeg 且有文件超过 24MB 时停下不传（不再悄悄传原片）。新命令 ffmpeg [--install]。
 // v2.13.2 2026-10-03  version 顺带查 GitHub 线上最新版，旧版提示重跑安装命令；补齐 2.13.x 更新记录。
@@ -140,7 +142,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.0';
+const VERSION = '2.14.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1481,7 +1483,13 @@ async function cmdVideoAnalyze() {
   }
   console.log(`✓ 分析稿已取回 ${got} 个文件 -> ${outDir}`);
   console.log(`ℹ 这部剧后面的集请追加到同一个项目：chenyu-pro video-analyze --project ${pid.slice(-8)} --video-file 第N集.mp4 [--yes]`);
-  if (partial) console.log(`⚠ 部分段未完成：${partial}\n  已完成的段已取回；不要整批重新提交（会对已成功的段重复扣分），把缺的集告诉用户。`);
+  if (partial) {
+    // 全部集都拿到结果才交付（v2.14.1）：平台已对临时性失败追加重试过，仍缺的集只补这几集，已成功的不会重复扣分。
+    console.log(`⛔ 还有集没分析成功：${partial}\n  全部集都拿到分析结果才能往下写、才能交付——不要拿不完整的分析稿写剧本，也不要跳过缺的集。\n` +
+      `  补分析（只传缺的那几集，已成功的集不会重复扣分）：\n    chenyu-pro video-analyze --project ${pid.slice(-8)} --video-file <缺的集.mp4,逗号分隔> --yes\n` +
+      `  补了仍失败，把上面的缺集清单原样告诉用户，由平台核实。`);
+    process.exitCode = 2;
+  }
   if (identityOnly) console.log('ℹ 分析完整。平台标记"人物身份待核"（单包分析常见，不是缺内容）——人物归属在下一步资产整理里由你按剧情确定，无需重交。');
   console.log('  下一步（零积分）：先整理资产，再动笔。');
   console.log(`   1) chenyu-pro assets-prepare --dir "${outDir}"   生成人物证据卡/场景清单/道具清单 + 待填的资产合并表`);
