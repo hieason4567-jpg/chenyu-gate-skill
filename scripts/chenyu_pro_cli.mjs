@@ -18,6 +18,7 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.3 2026-10-03  自带 ffmpeg 下载源加泉州节点（国内直连几秒下完，不用代理），对象存储做备用。
 // v2.14.2 2026-10-03  自带 ffmpeg 的下载源只用对象存储（不再从平台服务器下，那台是渠道服务器）。
 // v2.14.1 2026-10-03  批量视频分析：有集没分析成功时明确拦住（全部集拿到结果才交付），给出只补缺集的命令。
 //                    平台同步：分析并发默认 64、临时性失败追加重试 3 轮、语音识别失败重试 3 次。
@@ -143,7 +144,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.2';
+const VERSION = '2.14.3';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -906,11 +907,12 @@ const VIDEO_MIME = { '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.mkv': 'vi
 // Skill 自带 ffmpeg（v2.14.0）：安装器装完会下载一份到 ~/.codex/chenyu-pro/bin/，Codex 与 Claude Code 共用。
 // 起因：没装 ffmpeg 的机器只打印一行提示就照传原片（2026-10-03 一部 72 集全是原片上传，32MB 的集超过上游 24MB 上限、
 // 语音识别也拉取失败）。带 libx264 的精简版，gzip 后 29MB，不放 GitHub 仓库（国内下载慢、仓库会越来越大）。
-// 下载源放在更新分发用的对象存储上（不放渠道服务器，不占它的带宽）。有系统代理先走代理（国内直连境外存储又慢又会卡死），
-// 20 秒没数据就换下一种走法。要加备用源往 urls 里追加即可。
+// 下载源（不放渠道服务器，不占它的带宽）：先泉州节点（国内直连就能下，不用代理），再对象存储做备用
+// （境外，国内直连又慢又会卡死，有系统代理时走代理）。20 秒没数据就换下一种走法。泉州那份是 http，靠下面的 sha256 校验保证内容没被改。
 const BUNDLED_FFMPEG = {
-  urls: [
-    'https://pub-a98cf3718f684ce8b752168564943590.r2.dev/updates/runtime/chenyu-skill/chenyu-ffmpeg-6.1.1-win64.exe.gz',
+  sources: [
+    { url: 'http://121.205.88.149:8099/skill-downloads/chenyu-ffmpeg-6.1.1-win64.exe.gz', domestic: true },
+    { url: 'https://pub-a98cf3718f684ce8b752168564943590.r2.dev/updates/runtime/chenyu-skill/chenyu-ffmpeg-6.1.1-win64.exe.gz', domestic: false },
   ],
   gzSha256: 'f5ae838ff0a14e5781ffef25d44e275c19e9852ca1afece4159a2d28d70e789c',
   exeSha256: '04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00',
@@ -978,15 +980,21 @@ async function ensureFfmpeg({ quiet = false } = {}) {
     console.log('  正在下载自带的 ffmpeg（约 29MB，只下一次）…');
     let lastError = '';
     let ok = false;
-    // 有系统代理就先经代理把两个源都试一遍，再直连；没有代理只直连
+    // 顺序：国内节点直连 → 境外存储走代理（有代理时）→ 境外存储直连 → 国内节点走代理（直连被本机网络挡住时的最后一招）
     const hasProxy = Boolean(findSystemProxy());
-    const plan = [...(hasProxy ? BUNDLED_FFMPEG.urls.map((url) => ({ url, viaProxy: true })) : []), ...BUNDLED_FFMPEG.urls.map((url) => ({ url, viaProxy: false }))];
-    if (hasProxy) console.log('    检测到系统代理，经代理下载');
+    const domestic = BUNDLED_FFMPEG.sources.filter((s) => s.domestic);
+    const overseas = BUNDLED_FFMPEG.sources.filter((s) => !s.domestic);
+    const plan = [
+      ...domestic.map((s) => ({ url: s.url, viaProxy: false, label: '国内节点' })),
+      ...(hasProxy ? overseas.map((s) => ({ url: s.url, viaProxy: true, label: '备用存储（经系统代理）' })) : []),
+      ...overseas.map((s) => ({ url: s.url, viaProxy: false, label: '备用存储（直连）' })),
+      ...(hasProxy ? domestic.map((s) => ({ url: s.url, viaProxy: true, label: '国内节点（经系统代理）' })) : []),
+    ];
     for (const [index, step] of plan.entries()) {
       try { await downloadFrom(step.url, step.viaProxy); ok = true; break; } catch (error) {
         lastError = String(error?.message || error);
         try { fs.rmSync(gzPath, { force: true }); } catch { /* ignore */ }
-        if (index < plan.length - 1) console.log(`    这一路不通（${lastError.slice(0, 40)}），换下一路${plan[index + 1].viaProxy ? '' : '（直连）'}…`);
+        if (index < plan.length - 1) console.log(`    ${step.label}不通（${lastError.slice(0, 40)}），换${plan[index + 1].label}…`);
       }
     }
     if (!ok) throw new Error(lastError || '下载失败');
