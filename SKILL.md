@@ -2,7 +2,7 @@
 name: chenyu-gate
 description: 辰屿剧本工具免费版 —— 短剧剧本改编/写作的格式门、洗稿（只改名/换背景/男女频/降重）与洗稿检查、资产清单与形象表、已分镜客户端工程改写。纯本地，不联网，不用账号。
 metadata:
-  version: "2.13.1"
+  version: "2.13.2"
 ---
 
 # 辰屿剧本工具（免费版）
@@ -27,6 +27,9 @@ chenyu-gate help         # 全部命令
 
 CLI 位置：本 Skill 目录 `scripts/chenyu_gate_cli.mjs`；全局命令不存在时用
 `node <本Skill目录>/scripts/chenyu_gate_cli.mjs <命令>`。命令由你来敲，用户只说人话。
+
+**版本以 `chenyu-gate version` 为准**（不要看文件里的更新记录判断"最新版"）：它会顺带查线上最新版，
+提示本机是旧版时，先告诉用户重新运行安装命令升级，再开始干活。
 
 ## 输入类型与边界（先分清，再选路；拿不准跑 `chenyu-gate inspect <文件>`）
 

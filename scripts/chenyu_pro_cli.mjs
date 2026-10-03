@@ -15,7 +15,11 @@ import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
-// 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG。
+// 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.13.2 2026-10-03  version 顺带查 GitHub 线上最新版，旧版提示重跑安装命令；补齐 2.13.x 更新记录。
+// v2.13.1 2026-10-03  工程改写的造型描述保留 脸部/身材/发型（客户端出图只读描述，截掉会画成同一个发型和脸），缺的用卡片字段补回。
+// v2.13.0 2026-10-01  成片工程改写 remake-*（客户端工程 JSON/xlsx 不重新分镜）；场景道具出图描述；打包客户端同款审核；
+//                    安装后显示使用说明（guide）；免费版并入同一程序；gate 加载具进出分场景检查。
 // v2.12.0 2026-10-01  形象变体名改为身份/事件（和客户端建卡规则一致）；新命令 durations 按原片写【原片时长】【本场时长】（客户端转分镜不再压短）；补写说话人待核、道具归属抽帧核对、keep 用法。
 // v2.11.0 2026-10-01  视频分析一镜一行（平台检测切点）；形象按剧情事件建、导出 形象表.json 供客户端上传；洗稿映射 keep（设定词不换名）；括号内道具名不拆、物种叫法不当人名。
 // v2.10.0 2026-09-30  洗稿质量闭环：写→查→审→修→复查，达到交付标准才算写完，不交半成品。
@@ -132,7 +136,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.13.1';
+const VERSION = '2.13.2';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2245,8 +2249,23 @@ function cmdGuide() {
   return renderGuide(`辰屿 Pro Skill v${VERSION} 使用说明`, PRO_GUIDE_SECTIONS, topic);
 }
 
-function cmdVersion() {
+// 线上最新版：读 GitHub 上本版本（Pro / 免费版）的 SKILL.md 版本号。本机装的副本不会自己更新，
+// Agent 只看本地文件会以为旧版就是最新（2026-10-03 有 Agent 把 2.10.0 当最新）。
+const SKILL_RAW_BASE = `https://raw.githubusercontent.com/hieason4567-jpg/${EDITION === 'gate' ? 'chenyu-gate-skill' : 'chenyu-pro-skill'}/main`;
+const compareVersions = (a, b) => {
+  const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
+  return 0;
+};
+async function cmdVersion() {
   console.log(`chenyu-pro v${VERSION}`);
+  // 顺带查线上最新版：5 秒超时，查不到就不提示，不影响任何功能
+  try {
+    const res = await fetch(`${SKILL_RAW_BASE}/SKILL.md?t=${Date.now()}`, { signal: AbortSignal.timeout(5000) });
+    const latest = ((await res.text()).match(/version:\s*"?(\d+\.\d+\.\d+)/) || [])[1];
+    if (latest && compareVersions(latest, VERSION) > 0) console.log(`  线上最新 v${latest}，本机是旧版 → 重新运行安装命令升级：irm ${SKILL_RAW_BASE}/install.ps1 | iex`);
+    else if (latest) console.log('  已是线上最新版');
+  } catch { /* 网络不通时不提示 */ }
 }
 
 function cmdHelp() {
