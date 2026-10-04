@@ -13,7 +13,7 @@
 export const VARIANT_CANDIDATE_FILE = '形象变体候选.md';
 export const VARIANT_DECISION_FILE = '形象变体判定.json';
 
-// 强信号：剧情事件造成的、观众需要认出「他变了」的造型。日常换衣（睡衣、外套、换了件衬衫）不算。
+// 强信号：剧情事件造成的、观众需要认出「他变了」的造型；活动必须穿的功能性着装；原文明确写了换衣服的。日常换衣（睡衣、外套、换了件衬衫）不算。
 const STRONG_RULES = [
   ['住院/病号服', /病号服|病服|住院服|病人服|手术服/],
   ['受伤/包扎', /包扎|绷带|纱布|石膏|吊着胳膊|拄拐|血迹|带血|染血|伤口|淤青|鼻青脸肿|伤疤|烧伤/],
@@ -24,7 +24,11 @@ const STRONG_RULES = [
   ['年龄段不同', /幼年|童年|孩童|小时候|少年时|年轻时|青年时期|老年|年迈|白发苍苍/],
   ['伪装/假扮', /伪装|乔装|假扮|冒充|蒙面|面具|易容|变装/],
   ['身份制服', /警服|军装|制服|铠甲|战袍|官服|龙袍|袈裟|道袍|工服|保洁服|护士服|白大褂/],
-  ['变身/形态', /变身|化形|原形|兽形|虫茧|魂体|透明|发光的身体/]
+  ['变身/形态', /变身|化形|原形|兽形|虫茧|魂体|透明|发光的身体/],
+  // 2026-10-04 用户定：活动或场合必须穿的功能性着装要单独建形象（穿西装短裙在雪道上滑雪，画面是错的）
+  ['功能性着装', /滑雪服|滑雪装|雪服|雪镜|泳装|泳衣|泳裤|比基尼|潜水服|潜水装|赛车服|骑行服|击剑服|宇航服|航天服|防护服|防化服|消防服|救生衣|登山服|攀岩|马术服|球衣|拳击|道服|武道服|练功服|舞蹈服|芭蕾|戏服|演出服|厨师服/],
+  // 2026-10-04 用户定：原文明确写了换衣服的必须建卡，不能当日常换装跳过
+  ['明确换装', /换上|换成|换穿|换了一身|换装|更衣|脱下[^，。；]{0,12}穿上/]
 ];
 export function strongSignals(text) {
   const value = String(text || '');
@@ -84,8 +88,9 @@ export function buildCandidates(variantsJson, resolve = (name) => ({ source: nam
     let index = 0;
     for (const v of role.variants) {
       if (v === main) continue;
-      const text = [v.variant_name, v.description, v.change_cause, ...(v.looks || []).slice(0, 12)].join(' ');
-      const signals = strongSignals(text).filter((label) => !strongSignals([main.variant_name, main.description].join(' ')).includes(label));
+      // 「明确换装」只认镜头行里写出来的换装动作（由逐镜头扫描给出）。平台归并时填的 change_cause 是模型推测的（几乎每条都写「换…」），不算证据。
+      const text = [v.variant_name, v.description, ...(v.looks || []).slice(0, 12)].join(' ');
+      const signals = [...new Set([...strongSignals(text), ...strongSignals(v.change_cause)])].filter((label) => label !== '明确换装').filter((label) => !strongSignals([main.variant_name, main.description].join(' ')).includes(label));
       const rows = Number(v.rows || 0);
       if (rows < 3 && !signals.length) continue;
       index += 1;
@@ -138,7 +143,7 @@ export function scanAppearanceSignals(looks = [], { existing = [], scriptName = 
     for (const [label, hit] of role.signals) {
       // 常态：这个信号占了他一半以上的镜头（或一半以上的出场集）——一直穿制服的司机、只出场一集的铠甲武者，那就是他的主造型
       if (hit.rows * 2 >= role.rows || hit.episodes.size * 2 > role.episodes.size) continue;
-      if (hit.rows < 2) continue; // 只有一个镜头提到，多半是瞬时状态或记错
+      if (hit.rows < 2 && label !== '明确换装') continue; // 只有一个镜头提到，多半是瞬时状态或记错（换装动作本身就只有一个镜头，例外）
       const list = [...hit.episodes].sort((a, b) => a - b);
       // 平台候选里已经有同一角色、同一信号、集数有重叠的，就不重复列
       const covered = existing.some((c) => c.role === name && c.signals.includes(label) && c.episode_list.some((n) => hit.episodes.has(n)));
@@ -166,6 +171,9 @@ export function renderCandidates(candidates, { title = '' } = {}) {
     '  然后把候选列出的那几集里这个角色的【形象】改成 `角色=变体名（原因）`，场内补上可见的换装 △。',
     '- `skip`：只是日常换衣、同一身衣服的不同拍法、瞬时状态（淋湿、衣服扯乱、哭花妆）→ 不建，`reason` 写一句为什么。',
     '- 带强信号的候选默认应该 `build`；确实不建要写清楚原因（比如「只有一个镜头的回忆闪回，已并入主形象」）。',
+    '- **功能性着装**（滑雪服、泳装、潜水服、手术服、赛车服、练功服…）：本人**正在做**这项活动时必须建；只是到了那个场地但没参与的（坐在雪场休息区）不建；',
+    '  离开活动场地后要换回原来的形象——出现集里只有活动那几场用这个变体，不要整集、整剧都穿着它。',
+    '- **明确换装**：分析稿或原文明确写了他换了衣服（换上、换成、更衣），就要建，不能当成「日常换衣」跳过；没有任何换装动作、只是外观写法不同的才算日常换衣。',
     '',
     '| 编号 | 角色 | 造型（平台记录） | 出现集 | 首次出现 | 镜头行 | 强信号 | 原片记录的原因 |',
     '| --- | --- | --- | --- | --- | --- | --- | --- |'

@@ -16,10 +16,12 @@ import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashM
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals } from './variant_candidates.mjs';
-import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
+import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, placeLikeRoleNames, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.21.0 2026-10-04  变体规则跟上客户端这边新定的三条：① 活动必须穿的功能性着装（滑雪服/泳装/潜水服/赛车服/练功服…）是强信号，本人正在做这项活动时必须建变体，
+//                    离开后换回；② 原文明确写了换衣服的必须建，不当日常换装跳过；③ 角色名不能和地点/柜台/物件同名（前台、礼宾台），资产整理时必须改成指人的名字。
 // v2.20.0 2026-10-04  固定项目目录：video-analyze / video-fetch / video-wait / video-rebuild 不传 --out 时放到 我的文档/辰屿项目/<剧名>/分析稿
 //                    （以前是当前目录下的 chenyu-video-analysis，用户找不到）；CHENYU_PROJECTS_DIR 可改根目录。
 //                    新命令 deliver：交付时把 全集剧本.txt、形象表.json、分集/ 放在项目目录最外层，其余归到 资产/ 报告/ 分析稿/ 其他/。
@@ -177,7 +179,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.20.0';
+const VERSION = '2.21.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1742,7 +1744,7 @@ function cmdAssetsApply() {
   const s = result.stats;
   for (const w of [...checked.warnings, ...result.warnings]) console.log('  ⚠ ' + w);
   // 人物合并复核：合并后还剩下的「称谓/职业/镜头描述式」角色里戏份不小的，逐个要依据（是不是某个具名角色、剧里有没有名字）。
-  const roleReview = prepareRoleReview(dir, result.dossierText);
+  const roleReview = prepareRoleReview(dir, result.dossierText, map);
   if (roleReview.pending.length) {
     console.log(`ASSETS_REVIEW_PENDING  表已填全（整理版已写出 -> ${outDir}），但还有 ${roleReview.pending.length}/${roleReview.total} 个称谓角色没复核——同一个人常被记成不同称呼，合并通过不等于合对了：`);
     for (const line of roleReview.pending.slice(0, 30)) console.log('  ✗ ' + line);
@@ -1773,13 +1775,19 @@ function cmdAssetsApply() {
 }
 
 // 称谓角色复核（assets-apply 调用）：在整理版合集上重新取证（说话人已换成合并后的名字）
-function prepareRoleReview(dir, mergedDossierText) {
+function prepareRoleReview(dir, mergedDossierText, map = null) {
   const state = { total: 0, pending: [], reviewFile: '', decisionFile: '' };
   let labels;
   try { labels = [...collectAssetEvidence(parseDossier(mergedDossierText)).labels.values()]; } catch { return state; }
   const items = rolesNeedingReview(labels);
-  state.total = items.length;
-  if (!items.length) return state;
+  // 角色名和地点/物件同名：不能标 independent 放过，必须改名
+  const sceneNames = new Set();
+  for (const bucket of Object.values(map?.scenes || {})) for (const value of Object.values(bucket || {})) { const to = String(value && typeof value === 'object' ? value.to : value || '').trim(); if (to) sceneNames.add(to); }
+  const propNames = (Array.isArray(map?.props) ? map.props : []).map((p) => p?.name);
+  const clashes = placeLikeRoleNames(labels.map((x) => x.name), { places: [...sceneNames], props: propNames });
+  state.total = items.length + clashes.length;
+  state.nameClashes = clashes.map((c) => `角色名「${c.name}」${c.why}——人和地点/物件用同一个词，后面会全部混掉。在 资产合并表.json 里把这个角色改成指人的名字（前台→前台接待、礼宾台→礼宾员、保安室→保安员），原来的词不要放进 aliases`);
+  if (!items.length) { state.pending = [...state.nameClashes]; return state; }
   const workDir = path.join(dir, ASSET_DIR);
   fs.mkdirSync(workDir, { recursive: true });
   state.reviewFile = path.join(workDir, ROLE_REVIEW_FILE);
@@ -1789,7 +1797,7 @@ function prepareRoleReview(dir, mergedDossierText) {
   const decisions = roleDecisionTemplate(items, existing);
   fs.writeFileSync(state.reviewFile, renderRoleReview(items, { totalRoles: labels.length, descriptiveRoles: labels.filter((x) => isDescriptiveName(x.name)).length }), 'utf8');
   fs.writeFileSync(state.decisionFile, JSON.stringify(decisions, null, 1), 'utf8');
-  state.pending = pendingRoleReviews(items, decisions);
+  state.pending = [...state.nameClashes, ...pendingRoleReviews(items, decisions)];
   return state;
 }
 
@@ -1804,10 +1812,15 @@ function collectVariantCandidates(dir, map) {
     try { candidates = buildCandidates(JSON.parse(fs.readFileSync(source, 'utf8').replace(/^\uFEFF/, '')), resolve); } catch { candidates = []; }
   }
   const looks = [];
+  const CHANGE_ACTION_RE = /换上|换成|换穿|换了一身|更衣|脱下[^，。；]{0,12}穿上/;
+  const roleNames = [...new Set((map.characters || []).map((c) => String(c?.name || '').trim()).filter((name) => name.length >= 2))].sort((a, b) => b.length - a.length);
   try {
     const dossier = parseDossier(fs.readFileSync(path.join(dir, DOSSIER_FILE), 'utf8'));
     for (const row of dossier.rows) {
       const cell = row.cells[row.cells.length - 2] || '';
+      // 动作栏里写明了谁换了衣服（换上/更衣…）：原文明确换装必须建变体，按动作里出现的角色名记一条
+      const action = String(row.cells[3] || '');
+      if (CHANGE_ACTION_RE.test(action)) for (const name of roleNames) if (action.includes(name)) looks.push({ episode: row.episode, time: row.cells[0], who: name, look: '换装动作：' + action.slice(0, 60) });
       for (const part of String(cell).split(/[；;]/)) {
         const at = part.search(/[=＝]/);
         if (at > 0) looks.push({ episode: row.episode, time: row.cells[0], who: resolve(part.slice(0, at).trim()).merged, look: part.slice(at + 1).trim() });

@@ -15,6 +15,16 @@ export const ROLE_DECISION_FILE = '称谓角色复核.json';
 const DESCRIPTIVE_NAME_RE = /(男子|女子|男人|女人|少年|少女|青年|中年|老人|老者|老太|大妈|大爷|小孩|男孩|女孩|选手|学员|弟子|队员|成员|教练|宗师|武者|保安|保镖|司机|医生|护士|记者|主持|裁判|观众|群众|路人|工人|服务员|店员|经理|主管|助理|秘书|管家|佣人|警察|警员|士兵|军官|分析员|工作人员|负责人|手下|打手|随从|女友|男友|黑衣|白衣|蓝衣|红衣|灰衣|甲$|乙$|丙$|丁$|戊$|[A-Z]$|\d+$)/;
 export const isDescriptiveName = (name) => DESCRIPTIVE_NAME_RE.test(String(name || '')) || /^(EP\d+|OBS_)/i.test(String(name || ''));
 
+// 角色名本身是地点、柜台或物件的名字（「前台」「礼宾台」）：人和柜台用同一个词，后面每一步都会混。
+// 2026-10-04 一部剧里 [前台-前台] 出现 202 处，其中 179 处其实指的是柜台。必须改成指人的名字（前台接待、礼宾员、保安员）。
+const PLACE_LIKE_ROLE_RE = /^(前台|礼宾台?|吧台|柜台|收银台|服务台|咨询台|导诊台|问讯处|接待处|售票处|挂号处|门卫室?|保安室|值班室|传达室|门岗|岗亭|大堂|餐厅|厨房|后厨|病房|诊室|药房|办公室|会议室|车间|仓库|店铺|柜面|窗口)$/;
+export function placeLikeRoleNames(roleNames = [], { places = [], props = [] } = {}) {
+  const taken = new Set([...places, ...props].map((name) => String(name || '').trim()).filter(Boolean));
+  return [...new Set(roleNames.map((name) => String(name || '').trim()).filter(Boolean))]
+    .filter((name) => PLACE_LIKE_ROLE_RE.test(name) || taken.has(name))
+    .map((name) => ({ name, why: taken.has(name) ? '和整理出的场景/道具同名' : '是地点或柜台的名字' }));
+}
+
 const sizeOf = (value) => (value?.size ?? value?.length ?? 0);
 const epNumber = (id) => Number(String(id || '').replace(/\D/g, '')) || 0;
 
