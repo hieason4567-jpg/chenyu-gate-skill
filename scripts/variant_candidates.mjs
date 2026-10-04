@@ -24,7 +24,7 @@ const STRONG_RULES = [
   ['年龄段不同', /幼年|童年|孩童|小时候|少年时|年轻时|青年时期|老年|年迈|白发苍苍/],
   ['伪装/假扮', /伪装|乔装|假扮|冒充|蒙面|面具|易容|变装/],
   ['身份制服', /警服|军装|制服|铠甲|战袍|官服|龙袍|袈裟|道袍|工服|保洁服|护士服|白大褂/],
-  ['变身/形态', /变身|化形|原形|兽形|虫茧|魂体|透明|发光的身体/],
+  ['变身/形态', /变身|化形|现出原形|兽形|虫茧|魂体|半透明的身体|发光的身体/],
   // 2026-10-04 用户定：活动或场合必须穿的功能性着装要单独建形象（穿西装短裙在雪道上滑雪，画面是错的）
   ['功能性着装', /滑雪服|滑雪装|雪服|雪镜|泳装|泳衣|泳裤|比基尼|潜水服|潜水装|赛车服|骑行服|击剑服|宇航服|航天服|防护服|防化服|消防服|救生衣|登山服|攀岩|马术服|球衣|拳击|道服|武道服|练功服|舞蹈服|芭蕾|戏服|演出服|厨师服/],
   // 2026-10-04 用户定：原文明确写了换衣服的必须建卡，不能当日常换装跳过
@@ -235,5 +235,44 @@ export function checkAgainstScript(candidates, decisions = [], scriptUsage = [])
       flags.push(`${where} 判定建变体「${variant}」，但剧本这几集没有一场写 ${c.role}=${variant}${actual ? `（现在是 ${actual}）` : '（这几集的【形象】行里没有这个角色）'}——把对应场次的【形象】改过来`);
     }
   }
-  return { flags, built, skipped, total: candidates.length };
+  // ① 离开场合后要换回：功能性着装、病号服、婚礼、丧事、关押这类只属于那个场合的变体，出现在候选集数之外的集里，多半是忘了换回（男主在酒店大堂还穿着滑雪装）
+  // ② 同一场活动每个参与的人都要建：有人用了功能性着装变体，同场其他人还是各自最常用的那个形象，列出来确认是没参与还是漏了
+  const hints = [];
+  const EVENT_BOUND = new Set(['功能性着装', '住院/病号服', '婚礼', '丧事', '关押']);
+  const functional = new Set();
+  for (const c of candidates) {
+    const d = byId.get(c.id);
+    const variant = String(d?.variant || '').trim();
+    if (d?.decision !== 'build' || !variant || !c.signals.some((label) => EVENT_BOUND.has(label))) continue;
+    if (c.signals.includes('功能性着装')) functional.add(`${c.role}=${variant}`);
+    const eps = used.get(c.role);
+    if (!eps) continue;
+    const outside = [...eps.entries()].filter(([n, set]) => set.has(variant) && !c.episode_list.includes(n)).map(([n]) => n).sort((a, b) => a - b);
+    if (outside.length) hints.push(`${c.role}=${variant} 在第 ${outside.slice(0, 8).join('、')} 集也在用，但分析稿里这个造型只出现在第 ${c.episodes} 集——离开那个场合后要换回原来的形象（确实一直穿着就不用改）`);
+  }
+  if (functional.size) {
+    const count = new Map(); // 角色 -> Map(变体 -> 次数)，次数最多的当作他的常用形象
+    const scenes = new Map(); // 集#场 -> [{ name, variant }]
+    for (const u of scriptUsage) {
+      const name = String(u.name || '').trim();
+      const variant = String(u.variant || '').trim();
+      if (!count.has(name)) count.set(name, new Map());
+      count.get(name).set(variant, (count.get(name).get(variant) || 0) + 1);
+      const key = `${u.episode}#${u.scene}`;
+      if (!scenes.has(key)) scenes.set(key, []);
+      scenes.get(key).push({ name, variant });
+    }
+    const usual = (name) => [...(count.get(name) || new Map()).entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+    const missing = new Map(); // 角色 -> [场]
+    for (const [key, cast] of scenes) {
+      if (!cast.some((p) => functional.has(`${p.name}=${p.variant}`))) continue;
+      for (const p of cast) {
+        if (functional.has(`${p.name}=${p.variant}`) || p.variant !== usual(p.name) || (count.get(p.name)?.size || 0) > 1 && [...functional].some((item) => item.startsWith(p.name + '='))) continue;
+        if (!missing.has(p.name)) missing.set(p.name, []);
+        missing.get(p.name).push(key.replace('#', '集 '));
+      }
+    }
+    for (const [name, where] of missing) hints.push(`${name} 在第 ${where.slice(0, 4).join('、')}${where.length > 4 ? ' 等' + where.length + '场' : ''} 和穿了功能性着装的人同场，但还是平时的形象「${usual(name)}」——他也参与了这项活动就要给他建同类变体，只是在场没参与就不用改`);
+  }
+  return { flags, hints, built, skipped, total: candidates.length };
 }

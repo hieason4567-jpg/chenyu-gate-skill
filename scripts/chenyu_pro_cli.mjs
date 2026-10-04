@@ -15,11 +15,14 @@ import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, norma
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
-import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals } from './variant_candidates.mjs';
+import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals, strongSignals } from './variant_candidates.mjs';
 import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, placeLikeRoleNames, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.23.0 2026-10-04  补细节检查：① assets-export 道具清单为空时 ASSET_PROPS_MISSING（剧本没写【道具】行，客户端会按 0 件道具建卡）；
+//                    ② gate 提醒「变体名是服装名」「角色名是地点/柜台名」；③ variants --source 多查两项：场合性变体出现在候选集数之外（离开后没换回）、
+//                    同场有人穿了功能性着装而其他人还是平时形象；④ 没有分析稿的项目，variants 直接扫剧本动作行找可能漏建的变体。
 // v2.22.0 2026-10-04  变体出图沿用主形象的脸：asset-image 出非主形象时把主形象的图作参考（图生图），提示词照客户端「主状态身份母版」的写法；
 //                    主形象没出过图、这次也没选的变体不出，提示把主形象一起选上。
 // v2.21.1 2026-10-04  deliver 把 资产图/ 放在形象表旁边（之前放进了 资产/资产图，形象表里记的相对路径就对不上了）。
@@ -182,7 +185,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.22.0';
+const VERSION = '2.23.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -574,6 +577,12 @@ function parseVariantLine(l) {
   }
   return { entries, problems };
 }
+// 变体名是「颜色/材质 + 衣服」这种服装名（灰黑长衫、藏蓝上衣、白色西装）。事件类的着装名（病号服、滑雪服、婚纱…）是合规的。
+const EVENT_WEAR_NAME_RE = /^(病号服|病服|手术服|囚服|孝服|丧服|嫁衣|喜服|婚纱|礼服|滑雪服|滑雪装|泳装|泳衣|潜水服|赛车服|击剑服|宇航服|防护服|练功服|武道服|道服|军装|警服|制服|工服|校服|睡衣|浴袍|铠甲|战袍|官服|龙袍|戏服)$/;
+const CLOTHING_COLOR_RE = /(黑|白|灰|红|蓝|绿|黄|紫|粉|棕|褐|橙|青|米|卡其|藏青|藏蓝|墨绿|酒红|深|浅|素|花|条纹|格子|碎花|真丝|丝绸|棉麻|牛仔|皮|针织|毛呢|蕾丝)/;
+const CLOTHING_ITEM_RE = /(衫|衣|裙|裤|袍|褂|袄|外套|西装|西服|衬衫|T恤|卫衣|毛衣|夹克|风衣|大衣|马甲|背心|旗袍|唐装|汉服|套装|套裙|长裙|短裙)$/;
+const isClothingVariantName = (name) => { const v = String(name || '').trim(); return Boolean(v) && !EVENT_WEAR_NAME_RE.test(v) && CLOTHING_COLOR_RE.test(v) && CLOTHING_ITEM_RE.test(v); };
+
 // 形象变体表（Agent 交付的资产表之一）：markdown 表格，第一列=角色。
 // 变体名列按表头「变体名」定位（合集/variants 命令的表是 角色|变体数|变体名|…，变体名在第3列；
 // 手写表可能是 角色|变体名|…，在第2列）。找不到表头就默认第2列，并跳过纯数字（变体数列）。
@@ -636,6 +645,15 @@ function checkVariants(rawLines, ctx, errors, warnings) {
         }
         if (ctx.table && !(ctx.table.get(e.name)?.has(e.variant))) {
           warnings.push(`第${ln}行 「${e.name}=${e.variant}」不在形象变体表里——变体名要和表里一字不差（防止同一形象多个叫法），或把新变体补进表`);
+        }
+        ctx.warned = ctx.warned || new Set();
+        if (isClothingVariantName(e.variant) && !ctx.warned.has(`v:${e.name}=${e.variant}`)) {
+          ctx.warned.add(`v:${e.name}=${e.variant}`);
+          warnings.push(`第${ln}行 「${e.name}=${e.variant}」变体名是服装名——改成身份或事件（主形象写身份：老宅主人、公司总裁；事件形象写事件：病号服、新娘、冒充护卫），颜色款式写进外观描述`);
+        }
+        if (placeLikeRoleNames([e.name]).length && !ctx.warned.has(`n:${e.name}`)) {
+          ctx.warned.add(`n:${e.name}`);
+          warnings.push(`第${ln}行 角色名「${e.name}」是地点或柜台的名字——改成指人的名字（前台接待、礼宾员、保安员），否则正文里表示柜台/地点的同一个词会和角色混在一起`);
         }
         scene.declared.set(e.name, e.variant);
         ctx.last.set(e.name, { variant: e.variant });
@@ -1875,9 +1893,45 @@ function prepareVariantDecisions(dir, map) {
   return state;
 }
 
+// 没有分析稿的项目（小说改编、外部剧本洗稿）：直接扫剧本的动作行。某一场的 △ 里写到了病号服、滑雪、婚纱、换上…，
+// 而句子里提到的角色这一场还是他最常用的那个形象，就列出来让 Agent 确认要不要建变体。只提醒，不拦。
+function scanScriptForMissedVariants(scriptDir, usage) {
+  const count = new Map();
+  for (const u of usage) { if (!count.has(u.name)) count.set(u.name, new Map()); count.get(u.name).set(u.variant, (count.get(u.name).get(u.variant) || 0) + 1); }
+  const usual = (name) => [...(count.get(name) || new Map()).entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || '';
+  const hints = [];
+  const seen = new Set();
+  for (const file of listScriptFiles(scriptDir)) {
+    const episode = episodeNoOfFile(path.basename(file));
+    let declared = new Map();
+    let head = '';
+    for (const raw of String(fs.readFileSync(file, 'utf8')).split(/\r?\n/)) {
+      const line = raw.trim();
+      if (!line) continue;
+      if (isSceneHead(line)) { declared = new Map(); head = line.split(/\s+/)[0]; continue; }
+      if (isVariantLine(line)) { for (const e of parseVariantLine(line).entries) declared.set(e.name, e.variant); continue; }
+      if (!isActionLine(line)) continue;
+      const signals = strongSignals(line).filter((label) => label !== '身份制服');
+      if (!signals.length) continue;
+      for (const [name, variant] of declared) {
+        if (!line.includes(name) || variant !== usual(name) || (count.get(name)?.size || 0) > 1 && false) continue;
+        if (signals.some((label) => String(variant).includes(label.split('/')[0]))) continue;
+        const key = `${name}|${signals[0]}|${episode}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        hints.push(`第${episode}集 ${head}：「${line.slice(0, 46)}…」（${signals.join('、')}），但 ${name} 这一场的形象还是平时的「${variant}」`);
+      }
+    }
+  }
+  if (!hints.length) { console.log('  · 动作行里没有发现「住院/受伤包扎/婚礼/功能性着装/换装…」却没建变体的地方'); return; }
+  console.log(`  ⚠ ${hints.length} 处可能漏建了形象变体（动作里写到了事件或换装，形象却没变）——是剧情事件、功能性着装或明确换装就建变体，只是提了一句就不用改：`);
+  for (const line of hints.slice(0, 30)) console.log('   - ' + line);
+  if (hints.length > 30) console.log(`   … 另有 ${hints.length - 30} 处`);
+}
+
 // variants --source：对照资产整理时定下的形象变体判定，查「说了要建、剧本却没用上」的
 function checkVariantsAgainstSource(scriptDir, sourceArg, usage) {
-  if (!sourceArg) { console.log('  （加 --source <分析稿目录> 可对照平台记录的造型，查有没有漏建的变体）'); return; }
+  if (!sourceArg) { scanScriptForMissedVariants(scriptDir, usage); return; }
   const src = path.resolve(sourceArg);
   const variantsFile = path.join(src, 'character_variants.json');
   const mapFile = path.join(src, ASSET_DIR, ASSET_MAP_FILE);
@@ -1893,10 +1947,12 @@ function checkVariantsAgainstSource(scriptDir, sourceArg, usage) {
   const scriptCandidates = baseCandidates.map((c) => ({ ...c, role: renames[c.role] || c.role }));
   const report = checkAgainstScript(scriptCandidates, readJson(decisionFile), usage);
   if (!report.total) { console.log('  · 平台没有记录到主造型以外的造型，无需核对'); return; }
-  if (!report.flags.length) { console.log(`VARIANTS_PASS  ${report.total} 条造型候选：建 ${report.built} 个都已在剧本对应集用上，不建 ${report.skipped} 个都有原因`); return; }
+  const printHints = () => { if (!report.hints?.length) return; console.log(`  ⚠ 另有 ${report.hints.length} 处请确认（不影响通过）：`); for (const line of report.hints.slice(0, 20)) console.log('   - ' + line); };
+  if (!report.flags.length) { console.log(`VARIANTS_PASS  ${report.total} 条造型候选：建 ${report.built} 个都已在剧本对应集用上，不建 ${report.skipped} 个都有原因`); printHints(); return; }
   console.log(`VARIANTS_FLAGGED  ${report.flags.length} 处要返工（建 ${report.built} / 不建 ${report.skipped} / 共 ${report.total}）：`);
   for (const line of report.flags.slice(0, 40)) console.log('  ✗ ' + line);
   if (report.flags.length > 40) console.log(`  … 另有 ${report.flags.length - 40} 处`);
+  printHints();
   console.log('  按上面逐条改剧本的【形象】行（并在场内补可见的换装 △），或回到 资产整理/形象变体判定.json 改判定后重跑 assets-apply，再跑本命令直到 VARIANTS_PASS。');
   process.exitCode = 2;
 }
@@ -2789,6 +2845,14 @@ async function cmdAssetsExport() {
   fs.writeFileSync(lookFile, JSON.stringify(lookTable, null, 1), 'utf8');
   console.log(`✓ 形象表 -> ${lookFile}（客户端「人物设定与故事背景」上传它：按表建形象卡、按场绑定标签）`);
   for (const x of lookTableIssues(lookTable).slice(0, 20)) console.log('  ⚠ ' + x);
+  // 形象表带了场景清单 = 完整资产表，客户端会整个跳过自己的资产抽取；这时道具清单是空的，客户端里道具就是 0 件。
+  // 2026-10-04 一部 50 集的稿子全剧没有一行【道具】，导进客户端后「道具 0」。
+  if ((lookTable.places || []).length && !(lookTable.props || []).length) {
+    console.log('  ⛔ ASSET_PROPS_MISSING  全剧没有收集到任何道具——剧本里没有【道具】行。客户端拿到这张表会按「道具 0 件」建卡，不会自己再去找。');
+    console.log('     每场「人物：」行下面补一行【道具】，列这一场画面里人物拿着、用着、推动剧情的东西（写作规范「每场道具清单」），补完重跑 assets-export。');
+    console.log('     确认这部剧真的没有任何需要出现的道具，才可以原样交付，并把这一点告诉用户。');
+    process.exitCode = 2;
+  }
   const pn = propNameIssues(assets);
   for (const x of pn.slice(0, 40)) console.log('  ⚠ ' + x);
   if (pn.length > 40) console.log(`  … 另有 ${pn.length - 40} 处`);
