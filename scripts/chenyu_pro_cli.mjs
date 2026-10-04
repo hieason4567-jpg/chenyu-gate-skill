@@ -20,6 +20,9 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.20.0 2026-10-04  固定项目目录：video-analyze / video-fetch / video-wait / video-rebuild 不传 --out 时放到 我的文档/辰屿项目/<剧名>/分析稿
+//                    （以前是当前目录下的 chenyu-video-analysis，用户找不到）；CHENYU_PROJECTS_DIR 可改根目录。
+//                    新命令 deliver：交付时把 全集剧本.txt、形象表.json、分集/ 放在项目目录最外层，其余归到 资产/ 报告/ 分析稿/ 其他/。
 // v2.19.1 2026-10-04  资产整理做完是必停节点：ASSETS_PASS 后停下来向用户汇报并问要哪种稿，用户确认才动笔
 //                    （之前「不要做完一步就停」的规则把 Agent 推过了头，没问就写了 68 集 1:1 剧本）。一开始就说明要哪种稿的除外。
 // v2.19.0 2026-10-04  复核可以多代理并行：review-split 把待处理的称谓角色和形象变体按集数分包，每包自带相关镜头行原文和结论格式，
@@ -174,7 +177,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.19.1';
+const VERSION = '2.20.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -224,7 +227,7 @@ const args = process.argv.slice(2);
 const EDITION = process.env.CHENYU_EDITION === 'gate' ? 'gate' : 'pro';
 // 免费版老用法「chenyu-gate --file 剧本.txt / --dir 目录」= 格式门
 const cmd = EDITION === 'gate' && /^--(file|dir)$/.test(args[0] || '') ? 'gate' : (args[0] || 'help');
-const GATE_COMMANDS = new Set(['gate', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
+const GATE_COMMANDS = new Set(['gate', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
   'remake-prepare', 'remake-units', 'remake-lint', 'remake-review', 'remake-apply', 'guide', 'help', 'version', '--version', '-v']);
 const CLI_NAME = EDITION === 'gate' ? 'chenyu-gate' : 'chenyu-pro';
 if (EDITION === 'gate') {
@@ -1256,7 +1259,7 @@ async function cmdVideoFetch() {
   const jobs = (await api(`/api/projects/${target.id}/jobs`)).jobs || [];
   const running = jobs.find((j) => /video_reverse/.test(String(j.job_type || j.type || '')) && ['queued', 'running'].includes(String(j.status || '')));
   if (running) die(`项目《${target.title}》的分析稿正在处理（${running.message || running.status}），完成后再取`);
-  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const outDir = analysisOutDir(target.title);
   const { got, badSegments } = await downloadVideoAnalysis(target.id, outDir);
   if (!got) die(`项目《${target.title}》还没有分析稿`);
   console.log(`✓ 已取回《${target.title}》最新分析稿 ${got} 个文件 -> ${outDir}（零积分）`);
@@ -1270,7 +1273,7 @@ async function cmdVideoWait() {
   const fragment = arg('project') || die('缺 --project <id片段或剧名>');
   const target = await findProject(fragment);
   if (target.mode && target.mode !== 'video_reverse') die(`项目《${target.title}》不是视频分析项目`);
-  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const outDir = analysisOutDir(target.title);
   const deadline = Date.now() + Math.max(0.2, Number(arg('timeout-min', '8')) || 8) * 60000;
   const again = `chenyu-pro video-wait --project ${target.id.slice(-8)} --out "${outDir}"`;
   let lastMsg = '';
@@ -1344,7 +1347,7 @@ async function cmdVideoRebuild() {
   if (balanceBefore != null && after != null) console.log(`  实际扣除 ${balanceBefore - after} 分（报价上限约 ${high * TEXT_CALL_POINTS} 分）`);
   if (!done) die('重建超时，稍后用 chenyu-pro video-fetch 取结果');
   if (!['completed', 'succeeded', 'done'].includes(String(done.status))) die('重建失败，项目原分析稿未改动: ' + (done.message || done.status));
-  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const outDir = analysisOutDir(target.title);
   const { got } = await downloadVideoAnalysis(target.id, outDir);
   console.log(`✓ 已重建并取回 ${got} 个文件 -> ${outDir}`);
   if (consolidation === 'agent') console.log(`  下一步（零积分）：chenyu-pro assets-prepare --dir "${outDir}"，按剧情填表后 assets-apply。`);
@@ -1605,7 +1608,7 @@ async function cmdVideoAnalyze() {
   console.log(`✓ 已提交分析 ${videos.length} 个视频（仅分析，不代写）`);
   // 提交成功后平台在后台跑，和本命令是否还活着无关。很多 Agent 环境会在几分钟后掐掉长命令——把接着等的办法先说清楚。
   console.log(`ℹ 分析在平台后台进行（大任务可能几十分钟）。本命令会一直等到结束并自动取回；如果它被你的环境中断/超时：\n` +
-    `   不要重新提交（会重复扣分）。接着等：chenyu-pro video-wait --project ${pid.slice(-8)} --out "${path.resolve(arg('out', './chenyu-video-analysis'))}"\n` +
+    `   不要重新提交（会重复扣分）。接着等：chenyu-pro video-wait --project ${pid.slice(-8)} --out "${analysisOutDir(title)}"\n` +
     `   video-wait 每次最多等几分钟，没结束会返回「还在跑」——那就隔 2~3 分钟再跑一次，或建一个定时任务去跑，直到它打印「分析稿完整性」；拿到结果后把定时任务取消。`);
   if (flag('no-wait')) return;
 
@@ -1646,7 +1649,7 @@ async function cmdVideoAnalyze() {
   }
 
   // ⑥ 取回分析稿交给 Agent
-  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const outDir = analysisOutDir(title);
   const { got, badSegments } = await downloadVideoAnalysis(pid, outDir);
   await reportCharge();
   if (badSegments.length) {
@@ -2055,6 +2058,99 @@ function cmdReviewMerge() {
     for (const line of left.slice(0, 30)) console.log('   - ' + line);
   }
   console.log(`  下一步：chenyu-pro assets-apply --dir "${dir}"（并人/改名后名单会变，可能冒出新的待复核条目；还有就再 review-split 一轮）`);
+}
+
+// ---------- 固定的项目目录：我的文档/辰屿项目/<剧名>/ ----------
+// 以前各命令默认输出到「当前目录下的 chenyu-video-analysis」——Agent 的当前目录各不相同，用户找不到文件。
+// 现在不传 --out 时一律放到 我的文档/辰屿项目/<剧名>/ 下面；CHENYU_PROJECTS_DIR 可改根目录。
+function projectsRoot() {
+  if (process.env.CHENYU_PROJECTS_DIR) return path.resolve(process.env.CHENYU_PROJECTS_DIR);
+  const home = process.env.USERPROFILE || os.homedir();
+  // Windows「文档」被 OneDrive 接管时在 OneDrive 下面；哪个存在用哪个
+  const candidates = [path.join(home, 'Documents'), path.join(home, 'OneDrive', 'Documents'), path.join(home, 'OneDrive', '文档'), path.join(home, '文档')];
+  const docs = candidates.find((dir) => { try { return fs.statSync(dir).isDirectory(); } catch { return false; } }) || candidates[0];
+  return path.join(docs, '辰屿项目');
+}
+const safeDirName = (title) => String(title || '').replace(/[\\/:*?"<>|\r\n]+/g, '_').replace(/[. ]+$/g, '').trim().slice(0, 60) || '未命名项目';
+const projectDir = (title) => path.join(projectsRoot(), safeDirName(title));
+const analysisOutDir = (title) => (arg('out', '') ? path.resolve(arg('out')) : path.join(projectDir(title), '分析稿'));
+
+// 交付整理：把最终要用的东西放在项目目录最外层，其余归类。只复制、不移动、不改原文件。
+//   <剧名>/全集剧本.txt   <剧名>/形象表.json   <剧名>/分集/第001集.txt …   ← 用户和客户端要的就这三样
+//   <剧名>/资产/   <剧名>/报告/   <剧名>/分析稿/   <剧名>/其他/              ← 其余归类
+const DELIVER_RULES = [
+  ['资产', /资产|形象|变体|道具|场景|映射|设计|音色/],
+  ['报告', /审核|检查|报告|记录|建议|说明|核对|凭证|清单/]
+];
+function cmdDeliver() {
+  const scriptDir = path.resolve(arg('dir', '') || die('用法: chenyu-pro deliver --dir <剧本目录(放着 第N集.txt)> [--source <分析稿目录>] [--title 剧名] [--out 目录]'));
+  if (!fs.existsSync(scriptDir)) die('剧本目录不存在: ' + scriptDir);
+  const episodeFiles = listScriptFiles(scriptDir).filter((file) => episodeNoOfFile(path.basename(file)) > 0);
+  if (!episodeFiles.length) die('剧本目录里没有「第N集」文件: ' + scriptDir);
+  const workDirs = [...new Set([scriptDir, path.dirname(scriptDir), ...String(arg('work', '') || '').split(',').map((item) => item.trim()).filter(Boolean).map((item) => path.resolve(item))])];
+  // 剧名：--title > 形象表里的 title > 剧本目录的上一级目录名
+  let lookTableFile = '';
+  for (const dir of workDirs) { const file = path.join(dir, '形象表.json'); if (fs.existsSync(file)) { lookTableFile = file; break; } }
+  let title = arg('title', '');
+  if (!title && lookTableFile) { try { title = JSON.parse(fs.readFileSync(lookTableFile, 'utf8').replace(/^﻿/, '')).title || ''; } catch { /* 用目录名 */ } }
+  if (!title) title = path.basename(path.dirname(scriptDir));
+  const root = arg('out', '') ? path.resolve(arg('out')) : projectDir(title);
+  const put = (from, ...to) => { const target = path.join(root, ...to); fs.mkdirSync(path.dirname(target), { recursive: true }); if (path.resolve(from) !== path.resolve(target)) fs.copyFileSync(from, target); return target; };
+  const copyDir = (from, ...to) => { let n = 0; for (const entry of fs.readdirSync(from, { withFileTypes: true })) { const src = path.join(from, entry.name); if (entry.isDirectory()) n += copyDir(src, ...to, entry.name); else { put(src, ...to, entry.name); n += 1; } } return n; };
+  const count = { 分集: 0, 资产: 0, 报告: 0, 分析稿: 0, 其他: 0 };
+
+  // ① 分集 + 全集
+  const merged = [];
+  for (const file of episodeFiles) {
+    const n = episodeNoOfFile(path.basename(file));
+    const text = fs.readFileSync(file, 'utf8').replace(/^﻿/, '').replace(/\r\n/g, '\n').trim();
+    put(file, '分集', `第${String(n).padStart(3, '0')}集.txt`);
+    merged.push(text);
+    count.分集 += 1;
+  }
+  fs.mkdirSync(root, { recursive: true });
+  fs.writeFileSync(path.join(root, '全集剧本.txt'), merged.join('\n\n\n') + '\n', 'utf8');
+  // ② 形象表
+  if (lookTableFile) put(lookTableFile, '形象表.json');
+  // ③ 工作目录里的其他文件归类（只看这几个目录的第一层，子目录里只收 资产图）
+  const taken = new Set([...episodeFiles.map((file) => path.resolve(file)), lookTableFile ? path.resolve(lookTableFile) : '']);
+  for (const dir of workDirs) {
+    if (path.resolve(dir) === path.resolve(root)) continue;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const src = path.join(dir, entry.name);
+      if (entry.isDirectory()) { if (entry.name === ASSET_IMAGE_DIR) count.资产 += copyDir(src, '资产', ASSET_IMAGE_DIR); continue; }
+      if (taken.has(path.resolve(src)) || !/\.(md|txt|json|xlsx|csv|docx)$/i.test(entry.name)) continue;
+      if (episodeNoOfFile(entry.name) > 0) continue; // 别的目录里的分集稿（旧版本）不收
+      if (/全剧|全集|合并稿|全\d+集/.test(entry.name) && /\.(txt|md)$/i.test(entry.name)) continue; // 旧的全集文件：全集剧本.txt 已按分集重新生成
+      const bucket = (DELIVER_RULES.find(([, re]) => re.test(entry.name)) || ['其他'])[0];
+      put(src, bucket, entry.name);
+      count[bucket] += 1;
+      taken.add(path.resolve(src));
+    }
+  }
+  // ④ 分析稿（视频分析项目）：整理版在前，原始分析稿和整理过程留底
+  const source = arg('source', '') ? path.resolve(arg('source')) : '';
+  if (source && fs.existsSync(source) && path.resolve(source) !== path.resolve(path.join(root, '分析稿'))) count.分析稿 += copyDir(source, '分析稿');
+  else if (fs.existsSync(path.join(root, '分析稿'))) count.分析稿 = -1;
+  fs.writeFileSync(path.join(root, '目录说明.txt'), [
+    `《${title}》交付目录（${new Date().toLocaleString()} 由 chenyu-pro deliver 整理）`,
+    '',
+    '最常用的三样在最外层：',
+    `  全集剧本.txt      全部 ${count.分集} 集合在一个文件里`,
+    '  形象表.json       导入辰屿客户端「人物设定与故事背景」，按表建角色/场景/道具卡' + (lookTableFile ? '' : '（本次没有找到形象表）'),
+    '  分集\\            每集一个文件：第001集.txt …',
+    '',
+    '其余归类：',
+    '  资产\\            资产合并表、形象变体表、洗稿映射、资产图 等',
+    '  报告\\            审核报告、检查报告、洗稿建议、核对记录 等',
+    '  分析稿\\          视频分析取回的原始分析稿、整理版、资产整理过程',
+    '  其他\\            上面都不算的文件',
+    ''
+  ].join('\r\n'), 'utf8');
+  console.log(`✓ 已整理交付目录：${root}`);
+  console.log(`   全集剧本.txt（${count.分集} 集）${lookTableFile ? '、形象表.json' : '（没有找到形象表.json）'}、分集\\ ${count.分集} 个文件`);
+  console.log(`   资产\\ ${count.资产} 个、报告\\ ${count.报告} 个、其他\\ ${count.其他} 个${count.分析稿 > 0 ? `、分析稿\\ ${count.分析稿} 个` : count.分析稿 < 0 ? '、分析稿\\ 已在该目录下' : ''}`);
+  console.log('  把上面这个目录路径原样告诉用户：最外层就是全集、形象表和分集，其余都归好类了。原工作目录没有动。');
 }
 
 // 存档：把 Agent 本地做出来的东西回传到平台项目里留档（零积分）。只做记录，不改平台的原始分析稿、不改项目状态。
@@ -3153,6 +3249,7 @@ function cmdHelp() {
   chenyu-pro video-wait --project <id片段|剧名> [--out <目录>] [--timeout-min 8]  等分析跑完并自动取回(没跑完退出码3,再跑一次)
   chenyu-pro asset-image --look-table <形象表.json>                         列出可出资产图的条目(零积分)
   chenyu-pro asset-image --project <项目> --look-table <形象表.json> --pick 1,3 [--yes] [--force]  出横版资产图(约6分/张,先报价)
+  chenyu-pro deliver --dir <剧本目录> [--source <分析稿目录>] [--title 剧名]   整理交付目录到 我的文档\\辰屿项目\\<剧名>(全集/形象表/分集在最外层)
   chenyu-pro review-split --dir <分析稿目录> [--parts 4]   把待复核的称谓角色/形象变体分包，给子代理并行处理
   chenyu-pro review-merge --dir <分析稿目录>               合并各包结论到合并表和判定表
   chenyu-pro archive --project <id片段|剧名> --dir <分析稿目录> [--file a.md,b.json]  把合并表/整理版/检查报告存档到平台项目(零积分)
@@ -3186,7 +3283,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
