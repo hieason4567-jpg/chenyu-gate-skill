@@ -20,6 +20,7 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.21.1 2026-10-04  deliver 把 资产图/ 放在形象表旁边（之前放进了 资产/资产图，形象表里记的相对路径就对不上了）。
 // v2.21.0 2026-10-04  变体规则跟上客户端这边新定的三条：① 活动必须穿的功能性着装（滑雪服/泳装/潜水服/赛车服/练功服…）是强信号，本人正在做这项活动时必须建变体，
 //                    离开后换回；② 原文明确写了换衣服的必须建，不当日常换装跳过；③ 角色名不能和地点/柜台/物件同名（前台、礼宾台），资产整理时必须改成指人的名字。
 // v2.20.0 2026-10-04  固定项目目录：video-analyze / video-fetch / video-wait / video-rebuild 不传 --out 时放到 我的文档/辰屿项目/<剧名>/分析稿
@@ -179,7 +180,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.21.0';
+const VERSION = '2.21.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2131,7 +2132,8 @@ function cmdDeliver() {
     if (path.resolve(dir) === path.resolve(root)) continue;
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const src = path.join(dir, entry.name);
-      if (entry.isDirectory()) { if (entry.name === ASSET_IMAGE_DIR) count.资产 += copyDir(src, '资产', ASSET_IMAGE_DIR); continue; }
+      // 资产图放在形象表旁边：形象表里记的是相对路径「资产图/xxx.png」，挪进别的目录就对不上了
+      if (entry.isDirectory()) { if (entry.name === ASSET_IMAGE_DIR) count.资产 += copyDir(src, ASSET_IMAGE_DIR); continue; }
       if (taken.has(path.resolve(src)) || !/\.(md|txt|json|xlsx|csv|docx)$/i.test(entry.name)) continue;
       if (episodeNoOfFile(entry.name) > 0) continue; // 别的目录里的分集稿（旧版本）不收
       if (/全剧|全集|合并稿|全\d+集/.test(entry.name) && /\.(txt|md)$/i.test(entry.name)) continue; // 旧的全集文件：全集剧本.txt 已按分集重新生成
@@ -2154,7 +2156,8 @@ function cmdDeliver() {
     '  分集\\            每集一个文件：第001集.txt …',
     '',
     '其余归类：',
-    '  资产\\            资产合并表、形象变体表、洗稿映射、资产图 等',
+    '  资产图\\          已出的角色/场景/道具资产图（形象表按这个相对位置引用，不要挪走；没出过图就没有这个目录）',
+    '  资产\\            资产合并表、形象变体表、洗稿映射 等',
     '  报告\\            审核报告、检查报告、洗稿建议、核对记录 等',
     '  分析稿\\          视频分析取回的原始分析稿、整理版、资产整理过程',
     '  其他\\            上面都不算的文件',
