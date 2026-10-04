@@ -20,6 +20,10 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.25.0 2026-10-04  链路排查后的一批修复：① 资产整理/分包/存档等命令不传 --dir 时用最近一次取回的分析稿目录；② video-analyze 等到超时不再按「已完成」往下走；
+//                    ③ 造型审核或场景道具设计没过、形象设计没做完时不生成 形象表.json；④ deliver / assets-export 的剧名跳过「工作、剧本」这类目录名；
+//                    ⑤ 不传 --title 时用视频所在文件夹名当剧名；⑥ 形象变体判定按「角色#造型名」对号；⑦ 导出和交付检查对【形象】行的写法和格式门一致；
+//                    ⑧ 接口报错改为抛出（可选步骤真的可选，上传失败不会整条退出）；⑨ 安装脚本的快捷命令不再把含中文的用户目录写进文件。
 // v2.24.1 2026-10-04  SKILL.md 触发说明：用户一句话提到「辰屿 / 辰屿技能 / 用辰屿改编、反推、洗稿」就用本 Skill，命令由 Agent 敲。CLI 无功能变化。
 // v2.24.0 2026-10-04  不完整的形象表交不出去：assets-export 做完整性检查（角色外观、形象名、每集有形象、场景有描述、道具非空且已判定并有描述），
 //                    完整才生成「形象表.json」（LOOK_TABLE_PASS），不完整只写「形象表.未完成.json」并列出缺项；deliver 不收不完整的表。
@@ -189,7 +193,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.24.1';
+const VERSION = '2.25.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -337,7 +341,7 @@ async function api(pathName, { method = 'GET', body, auth = true, base, _retried
   if (!res.ok || data.ok === false || data.success === false) {
     // softFail：批量操作里单个失败不退出整个命令，由调用方记下来接着做下一个
     if (softFail) return { ok: false, status: res.status, error: String(data.error || JSON.stringify(data).slice(0, 200)) };
-    die(`${pathName} 失败(${res.status}): ${data.error || JSON.stringify(data).slice(0, 200)}`);
+    throw Object.assign(new Error(`${pathName} 失败(${res.status}): ${data.error || JSON.stringify(data).slice(0, 200)}`), { apiFailed: true, status: res.status });
   }
   return data;
 }
@@ -499,8 +503,18 @@ async function cmdSync() {
   const p = await findProject(fragment);
   // 复用平台云同步端点：成品正文打成客户端剧本包传 H1 云端脚本库（按 KEY 隔离）。
   // CLI 与辰屿客户端用同一个积分 KEY 时，客户端"云端脚本"点刷新即可下载。
-  const res = await api(`/api/projects/${p.id}/cloud-sync`, { method: 'POST', body: {} });
+  // --look-table <形象表.json>：把你导出的完整形象表一起带下去（LOOK_TABLE_PASS 的那份）。不带时平台只能从正文扫一张只有人物的简表。
+  let lookTable = null;
+  const tableArg = arg('look-table', '');
+  if (tableArg) {
+    lookTable = loadLookTableOrDie(path.resolve(tableArg));
+    if (lookTable.complete !== true) die(`这份形象表不完整（没有 LOOK_TABLE_PASS），不能同步给客户端：${path.resolve(tableArg)}\n  先 chenyu-pro assets-export 到 LOOK_TABLE_PASS`);
+  }
+  const res = await api(`/api/projects/${p.id}/cloud-sync`, { method: 'POST', body: lookTable ? { look_table: lookTable } : {}, timeoutMs: 120000 });
   console.log(`✓ 已同步到云端脚本库：《${p.title}》${res.episodes} 集`);
+  if (Array.isArray(res.missing_episodes) && res.missing_episodes.length) { console.log(`  ⛔ 集号不连续，缺第 ${res.missing_episodes.join('、')} 集——这几集没有回传过正文。补 save 后重新 sync，不要让用户拿到缺集的剧本。`); process.exitCode = 2; }
+  console.log(res.look_table === 'agent' ? '  形象表：已带上完整形象表（角色造型、场景、道具都按表建卡）'
+    : '  形象表：这次没带完整形象表，客户端只拿到正文里扫出的角色和形象名，造型、场景、道具由客户端自己做。要带上：加 --look-table <形象表.json>（或让用户在客户端手动上传）');
   console.log('  辰屿客户端"云端脚本"点刷新即可下载（需与 CLI 用同一积分 KEY）');
 }
 
@@ -1181,6 +1195,7 @@ async function fetchArtifactText(a) {
 // 取回项目最新分析稿到本地 + 逐段检查分析质量（每段只看最新版本）。零积分。
 async function downloadVideoAnalysis(pid, outDir) {
   fs.mkdirSync(outDir, { recursive: true });
+  try { saveConfig({ ...loadConfig(), last_analysis_dir: outDir }); } catch { /* 记不住不影响取回 */ }
   const arts = (await api(`/api/projects/${pid}/artifacts`)).artifacts || [];
   // 全剧合集是洗稿主用文件（剧集索引+人物/场景/道具资产表+事件表+逐集分析表），其余为备查。
   const want = ['video_reverse_全剧合集.md', 'video_reverse_source.md', 'video_reverse_replay_script.md', 'episode_index.json', 'identity_registry.json', 'character_variants.json', 'asset_consolidation.json', '资产合并表.md'];
@@ -1484,7 +1499,8 @@ async function cmdVideoAnalyze() {
   // ② 建 video_reverse 项目（或追加到 --project 指定的项目）：不设 auto_rewrite，平台分析完不会接着洗稿
   const count = files.length + urls.length;
   let pid = target?.id || '';
-  const title = target?.title || arg('title') || ('视频分析·' + new Date().toISOString().slice(0, 10));
+  const folderTitle = files.length ? inferTitleFromDir(path.dirname(path.resolve(files[0]))) : '';
+  const title = target?.title || arg('title') || (folderTitle && !/^(downloads?|desktop|documents?|videos?|下载|桌面|文档|视频)$/i.test(folderTitle) ? folderTitle : '') || ('视频分析·' + new Date().toISOString().slice(0, 16).replace(/[-:T]/g, ''));
   if (!pid) {
     const totalEpisodes = useFileNumbers ? Math.max(count, ...parsedNumbers) : count;
     const created = await api('/api/projects', { method: 'POST', body: {
@@ -1639,6 +1655,7 @@ async function cmdVideoAnalyze() {
   let lastMsg = '';
   let partial = '';
   let identityOnly = false;
+  let analysisEnded = false;
   let netFailStreak = 0;
   while (Date.now() < deadline) {
     await sleep(15000);
@@ -1656,7 +1673,7 @@ async function cmdVideoAnalyze() {
     const st = String(job.status || '');
     const msg = `${st} ${job.progress != null ? job.progress + '%' : ''} ${job.message || ''}`.trim();
     if (msg !== lastMsg) { console.log('  … ' + msg); lastMsg = msg; }
-    if (['succeeded', 'completed', 'done'].includes(st)) break;
+    if (['succeeded', 'completed', 'done'].includes(st)) { analysisEnded = true; break; }
     // needs_review = 部分段未完成或需复核：已完成的段照常取回，不整批重交（重交会对已成功段重复扣分）。
     if (st === 'needs_review') {
       let rj = job.result_json || {};
@@ -1665,11 +1682,18 @@ async function cmdVideoAnalyze() {
       // 没有失败段 = 分析完整，只是平台自动改编用的人物身份门没过（单包项目几乎必出），不是缺内容。
       if (failed.length) partial = `未完成的段: ${failed.map((f) => f.segment_id).join(', ')}`;
       else identityOnly = true;
+      analysisEnded = true;
       break;
     }
     if (['failed', 'cancelled', 'error'].includes(st)) { await reportCharge(); die('分析失败: ' + (job.message || st)); }
   }
 
+  if (!analysisEnded) {
+    // 等到本命令的上限还没结束：平台还在跑。这时去取分析稿拿到的是旧稿（或没有），不能当成完成。
+    console.log(`⏳ 等了 ${arg('timeout-min', '90')} 分钟分析还没结束（平台仍在后台跑，不是失败，不要重新提交）。\n  接着等：chenyu-pro video-wait --project ${pid.slice(-8)} --out "${analysisOutDir(title)}"`);
+    process.exitCode = 3;
+    return;
+  }
   // ⑥ 取回分析稿交给 Agent
   const outDir = analysisOutDir(title);
   const { got, badSegments } = await downloadVideoAnalysis(pid, outDir);
@@ -1709,7 +1733,7 @@ function readDossierOrDie(dir) {
 }
 
 function cmdAssetsPrepare() {
-  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dir = resolveAnalysisDir();
   const dossier = readDossierOrDie(dir);
   const files = renderEvidenceFiles(dossier, collectAssetEvidence(dossier));
   const outDir = path.join(dir, ASSET_DIR);
@@ -1735,7 +1759,7 @@ function cmdAssetsPrepare() {
 }
 
 function cmdAssetsApply() {
-  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dir = resolveAnalysisDir();
   const mapFile = path.resolve(arg('map', path.join(dir, ASSET_DIR, ASSET_MAP_FILE)));
   const outDir = path.resolve(arg('out', path.join(dir, '整理版')));
   const dossier = readDossierOrDie(dir);
@@ -1992,7 +2016,7 @@ function evidenceRows(dossier, name, episodes, cap = 36) {
 }
 
 function cmdReviewSplit() {
-  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dir = resolveAnalysisDir();
   const ctx = loadReviewContext(dir);
   const items = [
     ...ctx.roles.map((item) => ({ kind: 'role', id: item.id, first: item.episodes[0] || 0, item })),
@@ -2050,7 +2074,7 @@ function cmdReviewSplit() {
 }
 
 function cmdReviewMerge() {
-  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dir = resolveAnalysisDir();
   const ctx = loadReviewContext(dir);
   const packDir = path.join(dir, ASSET_DIR, REVIEW_PACK_DIR);
   if (!fs.existsSync(packDir)) die('还没分包：先 chenyu-pro review-split --dir <分析稿目录>');
@@ -2146,6 +2170,28 @@ const safeDirName = (title) => String(title || '').replace(/[\\/:*?"<>|\r\n]+/g,
 const projectDir = (title) => path.join(projectsRoot(), safeDirName(title));
 const analysisOutDir = (title) => (arg('out', '') ? path.resolve(arg('out')) : path.join(projectDir(title), '分析稿'));
 
+// 不传 --dir 时用哪个分析稿目录：最近一次 video-analyze / video-fetch / video-wait 取回的那个（记在本机配置里）。
+// 以前默认是「当前目录下的 chenyu-video-analysis」，而分析稿已经改放到 我的文档/辰屿项目/<剧名>/分析稿，不传 --dir 就找不到。
+function resolveAnalysisDir() {
+  if (arg('dir', '')) return path.resolve(arg('dir'));
+  const last = String(loadConfig().last_analysis_dir || '');
+  if (last && fs.existsSync(last)) { console.log(`（没传 --dir，用最近一次取回的分析稿目录：${last}）`); return last; }
+  return path.resolve('./chenyu-video-analysis');
+}
+// 剧名：工作目录常是 <剧名>/工作/剧本 这种结构，往上跳过「工作、剧本、分集」这类通用目录名
+const GENERIC_DIR_RE = /^(工作|剧本|分集|正文|脚本|整理版|分析稿|输出|交付|scripts?|work|works?pace|output|outputs|episodes?|src|dist|tmp|temp)$/i;
+function inferTitleFromDir(dir) {
+  let current = path.resolve(dir);
+  for (let i = 0; i < 4; i += 1) {
+    const name = path.basename(current);
+    if (name && !GENERIC_DIR_RE.test(name)) return name;
+    const parent = path.dirname(current);
+    if (parent === current) break;
+    current = parent;
+  }
+  return '';
+}
+
 // 交付整理：把最终要用的东西放在项目目录最外层，其余归类。只复制、不移动、不改原文件。
 //   <剧名>/全集剧本.txt   <剧名>/形象表.json   <剧名>/分集/第001集.txt …   ← 用户和客户端要的就这三样
 //   <剧名>/资产/   <剧名>/报告/   <剧名>/分析稿/   <剧名>/其他/              ← 其余归类
@@ -2164,7 +2210,7 @@ function cmdDeliver() {
   for (const dir of workDirs) { const file = path.join(dir, '形象表.json'); if (fs.existsSync(file)) { lookTableFile = file; break; } }
   let title = arg('title', '');
   if (!title && lookTableFile) { try { title = JSON.parse(fs.readFileSync(lookTableFile, 'utf8').replace(/^﻿/, '')).title || ''; } catch { /* 用目录名 */ } }
-  if (!title) title = path.basename(path.dirname(scriptDir));
+  if (!title) title = inferTitleFromDir(path.dirname(scriptDir)) || inferTitleFromDir(scriptDir) || '未命名项目';
   const root = arg('out', '') ? path.resolve(arg('out')) : projectDir(title);
   const put = (from, ...to) => { const target = path.join(root, ...to); fs.mkdirSync(path.dirname(target), { recursive: true }); if (path.resolve(from) !== path.resolve(target)) fs.copyFileSync(from, target); return target; };
   const copyDir = (from, ...to) => { let n = 0; for (const entry of fs.readdirSync(from, { withFileTypes: true })) { const src = path.join(from, entry.name); if (entry.isDirectory()) n += copyDir(src, ...to, entry.name); else { put(src, ...to, entry.name); n += 1; } } return n; };
@@ -2249,7 +2295,7 @@ const ARCHIVE_DEFAULT_FILES = [
 async function cmdArchive() {
   const fragment = arg('project') || die('缺 --project <id片段或剧名>');
   const p = await findProject(fragment);
-  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dir = resolveAnalysisDir();
   const targets = [];
   for (const parts of ARCHIVE_DEFAULT_FILES) {
     const file = path.join(dir, ...parts);
@@ -2420,7 +2466,7 @@ async function cmdAssetImage() {
 async function cmdArchiveFetch() {
   const fragment = arg('project') || die('缺 --project <id片段或剧名>');
   const p = await findProject(fragment);
-  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const dir = resolveAnalysisDir();
   const arts = (await api(`/api/projects/${p.id}/artifacts`)).artifacts || [];
   const seen = new Set();
   let got = 0;
@@ -2773,6 +2819,8 @@ const STYLING_AUDIT_HINTS = [
   [/unknown exact catalog ID/, 'wardrobeCapsuleId 不在形象库里（先跑 looks-prepare 取云端形象库）'],
   [/classification missing/, '缺 classification（roleDomain/roleTags）'],
 ];
+// assets-export 一次运行里各项审核的结果：形象表完不完整要一起看
+const exportState = { stylingAudit: '', designProblems: 0 };
 async function auditStylingLikeClient(lookTable, kitDir) {
   const audit = await import('./styling_audit.mjs');
   const kitFile = path.join(kitDir, 'kit.json');
@@ -2786,6 +2834,7 @@ async function auditStylingLikeClient(lookTable, kitDir) {
   fs.writeFileSync(path.join(kitDir, '客户端审核.json'), JSON.stringify(rows, null, 1), 'utf8');
   if (!bad.length) {
     console.log(`  ✓ 客户端造型审核：${rows.length}/${rows.length} 通过（上传后不会重调模型）  STYLING_AUDIT_PASS`);
+    exportState.stylingAudit = 'pass';
     return;
   }
   console.log(`  ✗ 客户端造型审核：${bad.length}/${rows.length} 个形象上传后会被客户端打回重调模型（扣用户积分），改 ${LOOK_DESIGN_FILE} 后重跑 assets-export：`);
@@ -2796,6 +2845,7 @@ async function auditStylingLikeClient(lookTable, kitDir) {
     for (const h of hints) console.log(`        → ${h}`);
   }
   console.log(`  明细：${path.join(kitDir, '客户端审核.json')}  STYLING_AUDIT_FAIL`);
+  exportState.stylingAudit = 'fail';
   process.exitCode = 2;
 }
 
@@ -2815,7 +2865,7 @@ async function cmdAssetsExport() {
   fs.writeFileSync(out.replace(/\.md$/, '.json'), JSON.stringify(assetListJson(assets), null, 1), 'utf8');
   const noLook = [...assets.people.values()].reduce((s, p) => s + [...p.looks.values()].filter((l) => !l.appearance).length, 0);
   console.log(`✓ 全局资产清单 -> ${out}（同名 .json 供程序读取）`);
-  const lookTable = lookTableJson(assets, { title: arg('title', '') });
+  const lookTable = lookTableJson(assets, { title: arg('title', '') || inferTitleFromDir(dir) });
   const lookFile = path.join(path.dirname(out), '形象表.json');
   // 形象设计（looks-prepare 生成任务、Agent 按造型 AI 格式回答）：并进形象表 look.styling，客户端当作模型回答走原流程
   const designFile = path.join(path.dirname(out), LOOK_DESIGN_FILE);
@@ -2844,6 +2894,7 @@ async function cmdAssetsExport() {
       const cards = (lookTable.props || []).filter((p) => p.card === true).length;
       const decided = (lookTable.props || []).filter((p) => p.card === true || p.card === false).length;
       console.log(`  场景道具设计：场景 ${placeDone}/${(lookTable.places || []).length} 有描述；道具 ${decided}/${(lookTable.props || []).length} 已判定，其中建卡 ${cards} 件`);
+      exportState.designProblems = ppIssues.length;
       for (const x of ppIssues.slice(0, 30)) console.log('  ⚠ ' + x);
       if (ppIssues.length > 30) console.log(`  … 另有 ${ppIssues.length - 30} 处`);
       const budget = propBudgetNote(lookTable);
@@ -2855,6 +2906,10 @@ async function cmdAssetsExport() {
   // 完整性：客户端只收这一张表，缺什么客户端里就缺什么。不完整的表不叫「形象表.json」，免得被当成成品交出去。
   const draftFile = path.join(path.dirname(lookFile), '形象表.未完成.json');
   const incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props') });
+  if (EDITION !== 'gate') {
+    if (exportState.stylingAudit === 'fail') incomplete.push('客户端造型审核没通过（STYLING_AUDIT_FAIL）：这样的形象上传后会被客户端打回、重调模型扣用户积分，按上面的明细改「形象设计.json」');
+    if (exportState.designProblems) incomplete.push(`场景道具设计还有 ${exportState.designProblems} 处问题（ASSET_DESIGN_FAIL）：按上面的明细改「场景道具设计.json」`);
+  }
   lookTable.complete = incomplete.length === 0;
   if (incomplete.length) {
     lookTable.incomplete = incomplete;
@@ -3356,7 +3411,7 @@ function cmdHelp() {
   chenyu-pro variants --dir <目录> [--out 文件]           从正文【形象】标记汇总形象变体表（每人几个变体、出现在哪几集哪几场）
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
-  chenyu-pro sync --project <id片段|剧名>                   同步到云端脚本库（辰屿客户端可下载）
+  chenyu-pro sync --project <id片段|剧名> [--look-table 形象表.json]  同步到云端脚本库（带上完整形象表，客户端按表建卡）
   chenyu-pro projects                                      项目列表
   【视频分析——本 Skill 唯一消耗积分的功能】
   chenyu-pro video-analyze --video-file a.mp4,b.mp4 [--yes]  视频→分析稿(只分析不代写)
@@ -3415,6 +3470,7 @@ try {
     console.error('  · 直连失败会自动改走系统代理（环境变量 HTTP(S)_PROXY / Windows 系统代理 / macOS 系统代理）；都不通就检查网络。指定代理: CHENYU_PROXY=http://地址:端口；一开始就走系统代理: CHENYU_KEEP_PROXY=1。在 Agent 沙箱里跑的，先确认沙箱允许联网。');
     process.exit(1);
   }
+  if (err?.apiFailed) { console.error('✗ ' + err.message); process.exit(1); }
   console.error('✗ 出错: ' + (err?.stack || err?.message || err));
   process.exit(1);
 }

@@ -26,7 +26,8 @@ foreach ($root in $roots) {
 $binDir = Join-Path $env:USERPROFILE ".codex\bin"
 New-Item -ItemType Directory -Force $binDir | Out-Null
 $cliPath = Join-Path $primary "scripts\chenyu_gate_cli.mjs"
-Set-Content -Path (Join-Path $binDir "chenyu-gate.cmd") -Encoding ascii -Value "@echo off`r`nnode `"$cliPath`" %*"
+# 路径用 %USERPROFILE% 在运行时展开：用户名含中文时，写死的路径经 ASCII 编码会变成问号，命令就坏了
+Set-Content -Path (Join-Path $binDir "chenyu-gate.cmd") -Encoding ascii -Value "@echo off`r`nnode `"%USERPROFILE%\.codex\skills\chenyu-gate\scripts\chenyu_gate_cli.mjs`" %*"
 Write-Host "  Command created -> $binDir\chenyu-gate.cmd"
 
 $userPath = [Environment]::GetEnvironmentVariable("Path", "User")

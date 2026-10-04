@@ -153,8 +153,8 @@ export function deliverCheck({ episodes, dossierText, map, review, gateErrors = 
   for (const { n, text } of episodes) {
     for (const line of String(text).split(/\r?\n/)) {
       if (!line.startsWith('【形象】')) continue;
-      for (const kv of line.slice(4).split(/[；;]/)) {
-        const m = kv.match(/^\s*([^=＝]+)[=＝]\s*([^（(]+)/);
+      for (const kv of line.slice(4).split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/)) {
+        const m = kv.match(/^\s*([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(][^）)]*[）)])?\s*$/);
         if (!m) continue;
         const key = `${m[1].trim()}=${m[2].trim()}`;
         if (!pairs.has(key)) pairs.set(key, n);

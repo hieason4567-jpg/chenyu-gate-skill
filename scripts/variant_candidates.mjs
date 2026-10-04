@@ -95,7 +95,7 @@ export function buildCandidates(variantsJson, resolve = (name) => ({ source: nam
       if (rows < 3 && !signals.length) continue;
       index += 1;
       candidates.push({
-        id: `${role.script}#${index}`,
+        id: `${role.script}#${String(v.variant_name || '').trim() || index}`, // 按造型名对号：并人后造型列表变长、顺序变了，旧判定也不会套到别的造型上
         role: role.script,
         source_role: [...role.sources].join(' / '),
         main_look: String(main.variant_name || '').trim(),

@@ -37,8 +37,8 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
       }
       if (/^人物[:：]/.test(l)) { for (const p of splitList(l.slice(3))) person(p).eps.add(n); continue; }
       if (l.startsWith('【形象】')) {
-        for (const kv of l.slice(4).split(/[；;]/)) {
-          const m = kv.match(/^\s*([^=＝]+)[=＝]\s*([^（(]+)(?:[（(]([^）)]*)[）)])?/);
+        for (const kv of l.slice(4).split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/)) { // 和格式门 parseVariantLine 同一套写法
+          const m = kv.match(/^\s*([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(]([^）)]*)[）)])?\s*$/);
           if (!m) continue;
           const who = m[1].trim(), v = m[2].trim();
           const p = person(who); p.eps.add(n);
@@ -292,7 +292,7 @@ export function lookTableCompleteness(table, { episodes = [], requireDesign = tr
   }
   if (noAppearance.length) issues.push(`${noAppearance.length} 个形象没写外观：${noAppearance.slice(0, 8).join('、')}${noAppearance.length > 8 ? ' 等' : ''}`);
   if (clothingNames.length) issues.push(`${clothingNames.length} 个形象名是服装名，要改成身份或事件（剧本【形象】行里全剧统一替换）：${clothingNames.slice(0, 8).join('、')}${clothingNames.length > 8 ? ' 等' : ''}`);
-  if (requireDesign && styled > 0 && styled < looksTotal) issues.push(`形象设计只做了 ${styled}/${looksTotal} 个：没做的那些客户端会自己另起一套造型，和已做的不统一`);
+  if (requireDesign && styled < looksTotal) issues.push(styled ? `形象设计只做了 ${styled}/${looksTotal} 个：没做的那些客户端会自己另起一套造型，和已做的不统一` : `形象设计还没做（0/${looksTotal}）：先 looks-prepare，再填「形象设计.json」`);
   const covered = new Set(Object.keys(table.scenes || {}).map((key) => Number(key)));
   const missingEps = episodes.filter((n) => !covered.has(Number(n)));
   if (missingEps.length) issues.push(`第 ${missingEps.slice(0, 12).join('、')}${missingEps.length > 12 ? ' 等' : ''} 集没有任何一场标了形象：这几集的【形象】行缺失`);
