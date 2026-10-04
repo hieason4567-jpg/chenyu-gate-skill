@@ -134,6 +134,7 @@ export function lookTableJson({ people, creatureSet, casting, scenes: places = n
       name,
       kind: creatureSet.has(name) || CREATURE_RE.test(name + (p.looks.get(main)?.appearance || '')) && !HUMAN_LOOK_RE.test(p.looks.get(main)?.appearance || '') ? 'creature' : GROUP_RE.test(name) ? 'group' : 'human',
       episodes: span(p.eps),
+      lines: p.lines || 0, // 全剧台词句数：用来判断是不是只露一面的龙套（客户端不读这个字段）
       looks: looks.map(([variant, lk]) => ({ variant, tag: `[${name}-${variant}]`, main: variant === main, reason: variant === main ? '' : lk.reason, appearance: lk.appearance, episodes: span(lk.eps) }))
     });
   }
@@ -273,7 +274,7 @@ const PLACE_LIKE_NAME_RE = /^(前台|礼宾台?|吧台|柜台|收银台|服务�
 // 2026-10-04：一张表道具清单是空的（剧本没写【道具】行），导进客户端后道具 0 件；同一张表形象名全是服装名。
 // 导出时文件照写、只打了警告，Agent 就把它交了。现在不完整的表不叫「形象表.json」，交付命令也不收。
 // episodes = 剧本实际有的集号；requireDesign = 完整版要做场景/道具设计，免费版不做。返回缺项清单，空 = 完整。
-export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false } = {}) {
+export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false, allowMany = false } = {}) {
   const issues = [];
   const chars = table.characters || [];
   if (!chars.length) issues.push('没有任何角色形象：剧本每场要有【形象】行');
@@ -308,8 +309,32 @@ export function lookTableCompleteness(table, { episodes = [], requireDesign = tr
     const cardNoDesc = props.filter((p) => p.card === true && !String(p.description || '').trim());
     if (cardNoDesc.length) issues.push(`${cardNoDesc.length} 件要建卡的道具没有外观描述：${cardNoDesc.slice(0, 6).map((p) => p.name).join('、')}${cardNoDesc.length > 6 ? ' 等' : ''}`);
   }
+  // 数量上限（2026-10-04）：一部 68 集的表导出了 188 个角色（114 个只出现一集的龙套）、72 件建卡道具——
+  // 客户端按表每个角色、每件建卡道具各建一张卡、各出一张图，全是用户的成本，而且卡越多越容易前后不一致。
+  // 确实是群像戏、道具戏的，加 --allow-many 导出，并把数量如实告诉用户。
+  if (!allowMany) {
+    const total = episodes.length || covered.size;
+    const span1 = (value) => String(value || '').split(/[、,，]/).filter(Boolean).length === 1 && !/[–\-~至]/.test(String(value || ''));
+    const solo = chars.filter((c) => c.kind !== 'group' && span1(c.episodes));
+    const roleCap = lookTableRoleCap(total);
+    if (chars.length > roleCap) {
+      const weakest = solo.slice().sort((a, b) => (a.lines || 0) - (b.lines || 0)).slice(0, 16).map((c) => `${c.name}(${c.lines || 0}句)`);
+      issues.push(`角色 ${chars.length} 个，超过上限 ${roleCap} 个（约每集 1.2 个，至少 30）；其中 ${solo.length} 个只出现一集。`
+        + `同一场里同一类的龙套并成一个群体角色（小区邻居数人、武考考生若干、测试场学员数人——人物行、【形象】行、台词的说话人都改成这个群体名），一组一张卡；`
+        + `有名字、跨集出现、戏份重的才单独建。台词最少的几个：${weakest.join('、')}`);
+    }
+    const carded = props.filter((p) => p.card === true);
+    const propCap = lookTablePropCap(total);
+    if (carded.length > propCap) {
+      const fewest = carded.slice().sort((a, b) => String(a.episodes || '').length - String(b.episodes || '').length).slice(0, 16).map((p) => p.name);
+      issues.push(`建卡道具 ${carded.length} 件，超过上限 ${propCap} 件（约每 2 集 1 件，至少 12；建议值是每 4 集 1 件）。`
+        + `只给「跨集反复出现、外观必须前后一致」的建卡，只出现一两集的单据、杯盘、手机改成 card:false。出现最少的几件：${fewest.join('、')}`);
+    }
+  }
   return issues;
 }
+export const lookTableRoleCap = (episodeCount) => Math.max(30, Math.ceil(Number(episodeCount || 0) * 1.2));
+export const lookTablePropCap = (episodeCount) => Math.max(12, Math.ceil(Number(episodeCount || 0) / 2));
 
 // 形象表体检：没写外观的形象、非主形象没写原因
 export function lookTableIssues(table) {
