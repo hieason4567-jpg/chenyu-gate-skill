@@ -18,6 +18,7 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.7 2026-10-04  SKILL.md 新增硬规则「做到交付为止，不要做完一步就停」：列明哪些情况不是停下的理由、哪几种才需要问用户。CLI 无功能变化。
 // v2.14.6 2026-10-04  提交后盯到结束：新命令 video-wait（等分析跑完并自动取回，每次最多等 8 分钟，没跑完退出码 3 再跑一次）；
 //                    video-analyze 提交成功后先说明「被中断怎么接着等、别重新提交」，新增 --no-wait；SKILL.md 要求提交后建定时任务
 //                    跑 video-wait、拿到结果后取消定时任务并直接进入资产整理。
@@ -152,7 +153,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.6';
+const VERSION = '2.14.7';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
