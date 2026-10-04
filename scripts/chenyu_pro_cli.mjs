@@ -18,6 +18,8 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.15.0 2026-10-04  存档：新命令 archive（把资产合并表、整理版合集、检查报告等回传到平台项目留档，零积分，只做记录，不改原始分析稿和项目状态）
+//                    和 archive-fetch（换机器/换 Agent 接着做时取回）。分阶段存：ASSETS_PASS 后一次，全部交付前再一次。
 // v2.14.7 2026-10-04  SKILL.md 新增硬规则「做到交付为止，不要做完一步就停」：列明哪些情况不是停下的理由、哪几种才需要问用户。CLI 无功能变化。
 // v2.14.6 2026-10-04  提交后盯到结束：新命令 video-wait（等分析跑完并自动取回，每次最多等 8 分钟，没跑完退出码 3 再跑一次）；
 //                    video-analyze 提交成功后先说明「被中断怎么接着等、别重新提交」，新增 --no-wait；SKILL.md 要求提交后建定时任务
@@ -153,7 +155,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.7';
+const VERSION = '2.15.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1706,6 +1708,79 @@ function cmdAssetsApply() {
   console.log(`  正式人物 ${s.characters} 个；场景 ${s.scene_writings} 种写法 -> ${s.scenes} 个；关键道具 ${s.key_props} 件；待核编号 ${s.unresolved_labels} 个；残留未处理编号 ${s.residual_observation_ids}`);
   console.log(`  台词列、字幕列、镜头列逐行核对一致（${s.rows} 行）`);
   console.log('  下一步：写作和洗稿都读 整理版/video_reverse_全剧合集.md；资产合并表.md 随稿交付。');
+  console.log(`  先存档（零积分，把合并结果留在平台项目里，换机器/换 Agent 接着做时能取回）：\n    chenyu-pro archive --project <项目id片段或剧名> --dir "${dir}"`);
+}
+
+// 存档：把 Agent 本地做出来的东西回传到平台项目里留档（零积分）。只做记录，不改平台的原始分析稿、不改项目状态。
+// 分阶段传：资产整理到 ASSETS_PASS 后传一次（合并表 + 整理版）；全部写完、检查通过后再传一次（--file 附上检查报告等）。
+// 文件名一律加「存档_」前缀，和平台自己的分析稿（video-fetch 取回的那几份）分开，互不覆盖；同名重复上传时平台按最新的算。
+const ARCHIVE_PREFIX = '存档_';
+const ARCHIVE_DEFAULT_FILES = [
+  [ASSET_DIR, ASSET_MAP_FILE],              // Agent 填的资产合并表（接着做时还原用）
+  ['整理版', '资产合并表.md'],               // 可读版合并表
+  ['整理版', DOSSIER_FILE]                   // 整理版全剧合集
+];
+async function cmdArchive() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const p = await findProject(fragment);
+  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const targets = [];
+  for (const parts of ARCHIVE_DEFAULT_FILES) {
+    const file = path.join(dir, ...parts);
+    if (fs.existsSync(file)) targets.push({ file, name: parts.join('_') });
+  }
+  // --file a.md,b.json：额外要留档的文件（洗稿检查报告、交付检查报告、形象表、改名映射等）
+  for (const extra of String(arg('file', '') || '').split(',').map((item) => item.trim()).filter(Boolean)) {
+    const file = path.resolve(extra);
+    if (!fs.existsSync(file)) die('要存档的文件不存在: ' + file);
+    targets.push({ file, name: path.basename(file) });
+  }
+  if (!targets.length) die(`没有可存档的文件：${dir} 下没有 资产整理/资产合并表.json 或 整理版/。\n  先做到 ASSETS_PASS，或用 --file 指定要存档的文件`);
+  let done = 0;
+  for (const t of targets) {
+    const ext = path.extname(t.file).toLowerCase();
+    if (!['.md', '.json', '.txt'].includes(ext)) { console.log(`  ⚠ 跳过（只存 .md/.json/.txt）：${t.file}`); continue; }
+    const content = fs.readFileSync(t.file, 'utf8');
+    if (!content.trim()) { console.log(`  ⚠ 跳过空文件：${t.file}`); continue; }
+    if (Buffer.byteLength(content) > 12 * 1024 * 1024) { console.log(`  ⚠ 跳过（超过 12MB）：${t.file}`); continue; }
+    const filename = ARCHIVE_PREFIX + t.name;
+    await api(`/api/projects/${p.id}/files`, {
+      method: 'POST',
+      body: { filename, title: filename, type: ext === '.json' ? 'json' : 'markdown', step_id: 'A01V', content, metadata_json: { agent_archive: true, cli_version: VERSION, archived_at: new Date().toISOString() } }
+    });
+    console.log(`  ✓ 已存档 ${filename}（${Math.round(Buffer.byteLength(content) / 1024)}KB）`);
+    done += 1;
+  }
+  if (!done) die('没有文件被存档');
+  console.log(`✓ 共存档 ${done} 个文件到《${p.title}》（零积分；只是留档，平台的原始分析稿和项目状态不变）。`);
+  console.log(`  以后取回：chenyu-pro archive-fetch --project ${p.id.slice(-8)} --dir <分析稿目录>`);
+}
+
+// 取回存档：换机器 / 换 Agent / 上下文丢了之后接着做。只取「存档_」开头的文件，按原来的相对位置放回分析稿目录。
+async function cmdArchiveFetch() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const p = await findProject(fragment);
+  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const arts = (await api(`/api/projects/${p.id}/artifacts`)).artifacts || [];
+  const seen = new Set();
+  let got = 0;
+  for (const a of arts) { // 列表按更新时间倒序：同名只取最新一份
+    const fn = String(a.filename || a.title || '');
+    if (!fn.startsWith(ARCHIVE_PREFIX) || seen.has(fn)) continue;
+    seen.add(fn);
+    const content = await fetchArtifactText(a);
+    if (!content.trim()) continue;
+    const name = fn.slice(ARCHIVE_PREFIX.length);
+    const known = ARCHIVE_DEFAULT_FILES.find((parts) => parts.join('_') === name);
+    const target = known ? path.join(dir, ...known) : path.join(dir, '存档', name);
+    if (fs.existsSync(target) && !flag('force')) { console.log(`  · 本地已有，未覆盖（要覆盖加 --force）：${target}`); continue; }
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, content, 'utf8');
+    console.log(`  ✓ ${target}`);
+    got += 1;
+  }
+  if (!seen.size) { console.log(`项目《${p.title}》还没有存档。`); return; }
+  console.log(`✓ 取回存档 ${got} 个文件（项目里共 ${seen.size} 份存档）-> ${dir}`);
 }
 
 // ---------- 洗稿：换名 + 洗稿检查（纯本地、零积分） ----------
@@ -2604,6 +2679,8 @@ function cmdHelp() {
   chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
   chenyu-pro video-analyze --project <id片段|剧名> --video-file 第4集.mp4  同一部剧追加到已有项目(人物跨集合并)
   chenyu-pro video-wait --project <id片段|剧名> [--out <目录>] [--timeout-min 8]  等分析跑完并自动取回(没跑完退出码3,再跑一次)
+  chenyu-pro archive --project <id片段|剧名> --dir <分析稿目录> [--file a.md,b.json]  把合并表/整理版/检查报告存档到平台项目(零积分)
+  chenyu-pro archive-fetch --project <id片段|剧名> --dir <分析稿目录> [--force]  取回存档接着做
   chenyu-pro video-fetch --project <id片段|剧名> [--out <目录>]  零积分重新取回最新分析稿(平台修复后用这个取)
   chenyu-pro video-rebuild --project <id片段|剧名> [--out <目录>] [--yes]  不重看视频，重建人物身份(和资产表)，只扣文本步骤分
     同一部剧只用一个项目：一次提交全部集，或后续用 --project 追加；不要一集一个项目、不要并发提交。
@@ -2633,7 +2710,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
