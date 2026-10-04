@@ -14,12 +14,15 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
-import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, isClothingVariantName, lookTableCompleteness, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals, strongSignals } from './variant_candidates.mjs';
 import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, placeLikeRoleNames, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.24.0 2026-10-04  不完整的形象表交不出去：assets-export 做完整性检查（角色外观、形象名、每集有形象、场景有描述、道具非空且已判定并有描述），
+//                    完整才生成「形象表.json」（LOOK_TABLE_PASS），不完整只写「形象表.未完成.json」并列出缺项；deliver 不收不完整的表。
+//                    起因：一张道具清单为空、形象名全是服装名的表被导进客户端，客户端道具 0 件。
 // v2.23.0 2026-10-04  补细节检查：① assets-export 道具清单为空时 ASSET_PROPS_MISSING（剧本没写【道具】行，客户端会按 0 件道具建卡）；
 //                    ② gate 提醒「变体名是服装名」「角色名是地点/柜台名」；③ variants --source 多查两项：场合性变体出现在候选集数之外（离开后没换回）、
 //                    同场有人穿了功能性着装而其他人还是平时形象；④ 没有分析稿的项目，variants 直接扫剧本动作行找可能漏建的变体。
@@ -185,7 +188,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.23.0';
+const VERSION = '2.24.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -577,11 +580,6 @@ function parseVariantLine(l) {
   }
   return { entries, problems };
 }
-// 变体名是「颜色/材质 + 衣服」这种服装名（灰黑长衫、藏蓝上衣、白色西装）。事件类的着装名（病号服、滑雪服、婚纱…）是合规的。
-const EVENT_WEAR_NAME_RE = /^(病号服|病服|手术服|囚服|孝服|丧服|嫁衣|喜服|婚纱|礼服|滑雪服|滑雪装|泳装|泳衣|潜水服|赛车服|击剑服|宇航服|防护服|练功服|武道服|道服|军装|警服|制服|工服|校服|睡衣|浴袍|铠甲|战袍|官服|龙袍|戏服)$/;
-const CLOTHING_COLOR_RE = /(黑|白|灰|红|蓝|绿|黄|紫|粉|棕|褐|橙|青|米|卡其|藏青|藏蓝|墨绿|酒红|深|浅|素|花|条纹|格子|碎花|真丝|丝绸|棉麻|牛仔|皮|针织|毛呢|蕾丝)/;
-const CLOTHING_ITEM_RE = /(衫|衣|裙|裤|袍|褂|袄|外套|西装|西服|衬衫|T恤|卫衣|毛衣|夹克|风衣|大衣|马甲|背心|旗袍|唐装|汉服|套装|套裙|长裙|短裙)$/;
-const isClothingVariantName = (name) => { const v = String(name || '').trim(); return Boolean(v) && !EVENT_WEAR_NAME_RE.test(v) && CLOTHING_COLOR_RE.test(v) && CLOTHING_ITEM_RE.test(v); };
 
 // 形象变体表（Agent 交付的资产表之一）：markdown 表格，第一列=角色。
 // 变体名列按表头「变体名」定位（合集/variants 命令的表是 角色|变体数|变体名|…，变体名在第3列；
@@ -2183,7 +2181,16 @@ function cmdDeliver() {
   fs.mkdirSync(root, { recursive: true });
   fs.writeFileSync(path.join(root, '全集剧本.txt'), merged.join('\n\n\n') + '\n', 'utf8');
   // ② 形象表
-  if (lookTableFile) put(lookTableFile, '形象表.json');
+  let lookTableNote = '';
+  if (lookTableFile) {
+    let table = null;
+    try { table = JSON.parse(fs.readFileSync(lookTableFile, 'utf8').replace(/^\uFEFF/, '')); } catch { /* 读不了按不完整处理 */ }
+    const gaps = !table ? ['文件读不了'] : table.complete === true ? [] : lookTableCompleteness(table, { episodes: episodeFiles.map((file) => episodeNoOfFile(path.basename(file))), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props') });
+    if (gaps.length) {
+      lookTableNote = `⛔ 形象表不完整（${gaps.length} 项），没有放进交付目录：\n     ✗ ${gaps.slice(0, 8).join('\n     ✗ ')}\n     补完重跑 assets-export 到 LOOK_TABLE_PASS，再重新 deliver。不要把不完整的形象表交给用户。`;
+      lookTableFile = '';
+    } else put(lookTableFile, '形象表.json');
+  } else lookTableNote = '⛔ 没有找到「形象表.json」（没导出过，或导出时不完整只有「形象表.未完成.json」）：先 assets-export 到 LOOK_TABLE_PASS。';
   // ③ 工作目录里的其他文件归类（只看这几个目录的第一层，子目录里只收 资产图）
   const taken = new Set([...episodeFiles.map((file) => path.resolve(file)), lookTableFile ? path.resolve(lookTableFile) : '']);
   for (const dir of workDirs) {
@@ -2194,6 +2201,7 @@ function cmdDeliver() {
       if (entry.isDirectory()) { if (entry.name === ASSET_IMAGE_DIR) count.资产 += copyDir(src, ASSET_IMAGE_DIR); continue; }
       if (taken.has(path.resolve(src)) || !/\.(md|txt|json|xlsx|csv|docx)$/i.test(entry.name)) continue;
       if (episodeNoOfFile(entry.name) > 0) continue; // 别的目录里的分集稿（旧版本）不收
+      if (/^形象表.(未完成|旧版)/.test(entry.name)) continue; // 形象表的草稿和旧版不进交付目录
       if (/全剧|全集|合并稿|全\d+集/.test(entry.name) && /\.(txt|md)$/i.test(entry.name)) continue; // 旧的全集文件：全集剧本.txt 已按分集重新生成
       const bucket = (DELIVER_RULES.find(([, re]) => re.test(entry.name)) || ['其他'])[0];
       put(src, bucket, entry.name);
@@ -2224,7 +2232,8 @@ function cmdDeliver() {
   console.log(`✓ 已整理交付目录：${root}`);
   console.log(`   全集剧本.txt（${count.分集} 集）${lookTableFile ? '、形象表.json' : '（没有找到形象表.json）'}、分集\\ ${count.分集} 个文件`);
   console.log(`   资产\\ ${count.资产} 个、报告\\ ${count.报告} 个、其他\\ ${count.其他} 个${count.分析稿 > 0 ? `、分析稿\\ ${count.分析稿} 个` : count.分析稿 < 0 ? '、分析稿\\ 已在该目录下' : ''}`);
-  console.log('  把上面这个目录路径原样告诉用户：最外层就是全集、形象表和分集，其余都归好类了。原工作目录没有动。');
+  if (lookTableNote) { console.log('  ' + lookTableNote); process.exitCode = 2; }
+  console.log(lookTableNote ? '  形象表补完之前不算交付完成。' : '  把上面这个目录路径原样告诉用户：最外层就是全集、形象表和分集，其余都归好类了。原工作目录没有动。');
 }
 
 // 存档：把 Agent 本地做出来的东西回传到平台项目里留档（零积分）。只做记录，不改平台的原始分析稿、不改项目状态。
@@ -2842,17 +2851,25 @@ async function cmdAssetsExport() {
       else { console.log(`  明细见上，改 ${PLACE_PROP_DESIGN_FILE} 后重跑  ASSET_DESIGN_FAIL`); process.exitCode = 2; }
     } catch (e) { console.log(`  ⚠ ${PLACE_PROP_DESIGN_FILE} 读不了：${e.message}`); }
   }
-  fs.writeFileSync(lookFile, JSON.stringify(lookTable, null, 1), 'utf8');
-  console.log(`✓ 形象表 -> ${lookFile}（客户端「人物设定与故事背景」上传它：按表建形象卡、按场绑定标签）`);
-  for (const x of lookTableIssues(lookTable).slice(0, 20)) console.log('  ⚠ ' + x);
-  // 形象表带了场景清单 = 完整资产表，客户端会整个跳过自己的资产抽取；这时道具清单是空的，客户端里道具就是 0 件。
-  // 2026-10-04 一部 50 集的稿子全剧没有一行【道具】，导进客户端后「道具 0」。
-  if ((lookTable.places || []).length && !(lookTable.props || []).length) {
-    console.log('  ⛔ ASSET_PROPS_MISSING  全剧没有收集到任何道具——剧本里没有【道具】行。客户端拿到这张表会按「道具 0 件」建卡，不会自己再去找。');
-    console.log('     每场「人物：」行下面补一行【道具】，列这一场画面里人物拿着、用着、推动剧情的东西（写作规范「每场道具清单」），补完重跑 assets-export。');
-    console.log('     确认这部剧真的没有任何需要出现的道具，才可以原样交付，并把这一点告诉用户。');
+  // 完整性：客户端只收这一张表，缺什么客户端里就缺什么。不完整的表不叫「形象表.json」，免得被当成成品交出去。
+  const draftFile = path.join(path.dirname(lookFile), '形象表.未完成.json');
+  const incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props') });
+  lookTable.complete = incomplete.length === 0;
+  if (incomplete.length) {
+    lookTable.incomplete = incomplete;
+    fs.writeFileSync(draftFile, JSON.stringify(lookTable, null, 1), 'utf8');
+    // 之前导出过的「形象表.json」已经和现在的剧本对不上了：改名留底，避免被误交
+    if (fs.existsSync(lookFile)) fs.renameSync(lookFile, lookFile.replace(/\.json$/, `.旧版-${Date.now()}.json`));
+    console.log(`⛔ LOOK_TABLE_INCOMPLETE  形象表还缺 ${incomplete.length} 项，没有生成「形象表.json」（草稿在 ${draftFile}，不要把草稿交给用户或导入客户端）：`);
+    for (const x of incomplete) console.log('   ✗ ' + x);
+    console.log('   逐项补完后重跑 chenyu-pro assets-export，出现 LOOK_TABLE_PASS 才有「形象表.json」。');
     process.exitCode = 2;
+  } else {
+    fs.writeFileSync(lookFile, JSON.stringify(lookTable, null, 1), 'utf8');
+    try { fs.rmSync(draftFile, { force: true }); } catch { /* 草稿删不掉无妨 */ }
+    console.log(`✓ LOOK_TABLE_PASS  形象表 -> ${lookFile}（角色 ${lookTable.characters.length}、场景 ${(lookTable.places || []).length}、道具 ${(lookTable.props || []).length}；客户端「人物设定与故事背景」只上传这一个文件）`);
   }
+  for (const x of lookTableIssues(lookTable).slice(0, 20)) console.log('  ⚠ ' + x);
   const pn = propNameIssues(assets);
   for (const x of pn.slice(0, 40)) console.log('  ⚠ ' + x);
   if (pn.length > 40) console.log(`  … 另有 ${pn.length - 40} 处`);

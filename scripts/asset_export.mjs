@@ -262,6 +262,55 @@ export function propBudgetNote(table) {
   return { over: true, text: `${line}\n  建卡道具偏多。只给「跨集反复出现、外观必须前后一致」的物件建卡；下面这些出现最少，考虑改成 card:false：\n  ${weakest.join('、')}` };
 }
 
+// 变体名是「颜色/材质 + 衣服」这种服装名（灰黑长衫、藏蓝上衣）。事件类的着装名（病号服、滑雪服、婚纱…）合规。
+const EVENT_WEAR_NAME_RE = /^(病号服|病服|手术服|囚服|孝服|丧服|嫁衣|喜服|婚纱|礼服|滑雪服|滑雪装|泳装|泳衣|潜水服|赛车服|击剑服|宇航服|防护服|练功服|武道服|道服|军装|警服|制服|工服|校服|睡衣|浴袍|铠甲|战袍|官服|龙袍|戏服)$/;
+const CLOTHING_COLOR_RE = /(黑|白|灰|红|蓝|绿|黄|紫|粉|棕|褐|橙|青|米|卡其|藏青|藏蓝|墨绿|酒红|深|浅|素|花|条纹|格子|碎花|真丝|丝绸|棉麻|牛仔|皮|针织|毛呢|蕾丝)/;
+const CLOTHING_ITEM_RE = /(衫|衣|裙|裤|袍|褂|袄|外套|西装|西服|衬衫|T恤|卫衣|毛衣|夹克|风衣|大衣|马甲|背心|旗袍|唐装|汉服|套装|套裙|长裙|短裙)$/;
+export const isClothingVariantName = (name) => { const v = String(name || '').trim(); return Boolean(v) && !EVENT_WEAR_NAME_RE.test(v) && CLOTHING_COLOR_RE.test(v) && CLOTHING_ITEM_RE.test(v); };
+const PLACE_LIKE_NAME_RE = /^(前台|礼宾台?|吧台|柜台|收银台|服务台|咨询台|导诊台|问讯处|接待处|售票处|挂号处|门卫室?|保安室|值班室|传达室|门岗|岗亭|大堂|餐厅|厨房|后厨|病房|诊室|药房|办公室|会议室|车间|仓库|店铺|柜面|窗口)$/;
+
+// 形象表完整性：客户端只收这一张表，表里有场景清单就整张按表建卡、不再自己找资产——所以交出去的表缺什么，客户端里就缺什么。
+// 2026-10-04：一张表道具清单是空的（剧本没写【道具】行），导进客户端后道具 0 件；同一张表形象名全是服装名。
+// 导出时文件照写、只打了警告，Agent 就把它交了。现在不完整的表不叫「形象表.json」，交付命令也不收。
+// episodes = 剧本实际有的集号；requireDesign = 完整版要做场景/道具设计，免费版不做。返回缺项清单，空 = 完整。
+export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false } = {}) {
+  const issues = [];
+  const chars = table.characters || [];
+  if (!chars.length) issues.push('没有任何角色形象：剧本每场要有【形象】行');
+  const noAppearance = [];
+  const clothingNames = [];
+  let styled = 0;
+  let looksTotal = 0;
+  for (const c of chars) {
+    if (PLACE_LIKE_NAME_RE.test(String(c.name || '').trim())) issues.push(`角色名「${c.name}」是地点或柜台的名字：改成指人的名字（前台接待、礼宾员、保安员）`);
+    for (const l of c.looks || []) {
+      looksTotal += 1;
+      if (!String(l.appearance || '').trim()) noAppearance.push(l.tag || `${c.name}-${l.variant}`);
+      if (isClothingVariantName(l.variant)) clothingNames.push(`${c.name}=${l.variant}`);
+      if (l.styling && String(l.styling.description || '').trim()) styled += 1;
+    }
+  }
+  if (noAppearance.length) issues.push(`${noAppearance.length} 个形象没写外观：${noAppearance.slice(0, 8).join('、')}${noAppearance.length > 8 ? ' 等' : ''}`);
+  if (clothingNames.length) issues.push(`${clothingNames.length} 个形象名是服装名，要改成身份或事件（剧本【形象】行里全剧统一替换）：${clothingNames.slice(0, 8).join('、')}${clothingNames.length > 8 ? ' 等' : ''}`);
+  if (requireDesign && styled > 0 && styled < looksTotal) issues.push(`形象设计只做了 ${styled}/${looksTotal} 个：没做的那些客户端会自己另起一套造型，和已做的不统一`);
+  const covered = new Set(Object.keys(table.scenes || {}).map((key) => Number(key)));
+  const missingEps = episodes.filter((n) => !covered.has(Number(n)));
+  if (missingEps.length) issues.push(`第 ${missingEps.slice(0, 12).join('、')}${missingEps.length > 12 ? ' 等' : ''} 集没有任何一场标了形象：这几集的【形象】行缺失`);
+  const places = table.places || [];
+  if (!places.length) issues.push('没有任何场景：剧本的场次头写法不对，一个场景都没识别出来');
+  const props = table.props || [];
+  if (!props.length && !allowNoProps) issues.push('道具清单是空的：剧本里没有【道具】行。每场「人物：」行下面补【道具】（人物拿着、用着、推动剧情的东西）；这部剧确实没有任何道具才加 --no-props 导出');
+  if (requireDesign) {
+    const placeNoDesc = places.filter((p) => !String(p.description || '').trim());
+    if (placeNoDesc.length) issues.push(`${placeNoDesc.length}/${places.length} 个场景没有描述：先 looks-prepare 再填「场景道具设计.json」（${placeNoDesc.slice(0, 5).map((p) => p.name).join('、')}${placeNoDesc.length > 5 ? ' 等' : ''}）`);
+    const undecided = props.filter((p) => p.card !== true && p.card !== false);
+    if (undecided.length) issues.push(`${undecided.length}/${props.length} 件道具还没定建不建卡（card）：${undecided.slice(0, 6).map((p) => p.name).join('、')}${undecided.length > 6 ? ' 等' : ''}`);
+    const cardNoDesc = props.filter((p) => p.card === true && !String(p.description || '').trim());
+    if (cardNoDesc.length) issues.push(`${cardNoDesc.length} 件要建卡的道具没有外观描述：${cardNoDesc.slice(0, 6).map((p) => p.name).join('、')}${cardNoDesc.length > 6 ? ' 等' : ''}`);
+  }
+  return issues;
+}
+
 // 形象表体检：没写外观的形象、非主形象没写原因
 export function lookTableIssues(table) {
   const issues = [];
