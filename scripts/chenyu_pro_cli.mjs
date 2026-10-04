@@ -15,10 +15,12 @@ import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, norma
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
-import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates } from './variant_candidates.mjs';
+import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals } from './variant_candidates.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.17.1 2026-10-04  形象变体候选多一路证据：直接扫逐集分析表每个镜头的外观原文里的强信号（病号服/包扎/婚纱/囚服/幼年/伪装…），
+//                    不依赖平台归并得对不对；老项目没有 character_variants.json 也能出候选。占了角色一半以上镜头的算常态，不列。只读，不改平台产物。
 // v2.17.0 2026-10-04  形象变体不再靠 Agent 凭记忆：assets-apply 在人物/场景/道具合并通过后，按平台的 character_variants.json 列出
 //                    「形象变体候选」（每个角色主造型以外的造型，带强信号标记），Agent 逐条表态 build/skip，全部表态才给 ASSETS_PASS；
 //                    variants --source 对照判定查剧本漏用（VARIANTS_PASS / VARIANTS_FLAGGED）。起因：72 集一稿 31 个角色全是单形象，
@@ -164,7 +166,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.17.0';
+const VERSION = '2.17.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1747,15 +1749,34 @@ function cmdAssetsApply() {
   console.log(`  先存档（零积分，把合并结果留在平台项目里，换机器/换 Agent 接着做时能取回）：\n    chenyu-pro archive --project <项目id片段或剧名> --dir "${dir}"`);
 }
 
+// 候选 = 平台归并好的造型（character_variants.json，可能没有）+ 逐集分析表每个镜头外观原文里的强信号（一定有）。
+// 两路都只读：不改 character_variants.json，也不改分析稿。
+function collectVariantCandidates(dir, map) {
+  const labels = Object.fromEntries([...(map.labels || new Map()).entries()].map(([key, value]) => [key, value?.to || '']));
+  const resolve = nameResolver({ assetMap: { characters: map.characters, labels } });
+  let candidates = [];
+  const source = path.join(dir, 'character_variants.json');
+  if (fs.existsSync(source)) {
+    try { candidates = buildCandidates(JSON.parse(fs.readFileSync(source, 'utf8').replace(/^\uFEFF/, '')), resolve); } catch { candidates = []; }
+  }
+  const looks = [];
+  try {
+    const dossier = parseDossier(fs.readFileSync(path.join(dir, DOSSIER_FILE), 'utf8'));
+    for (const row of dossier.rows) {
+      const cell = row.cells[row.cells.length - 2] || '';
+      for (const part of String(cell).split(/[；;]/)) {
+        const at = part.search(/[=＝]/);
+        if (at > 0) looks.push({ episode: row.episode, time: row.cells[0], who: resolve(part.slice(0, at).trim()).merged, look: part.slice(at + 1).trim() });
+      }
+    }
+  } catch { /* 读不了合集就只用平台那一路 */ }
+  return [...candidates, ...scanAppearanceSignals(looks, { existing: candidates })];
+}
+
 // 形象变体候选与判定（assets-apply 调用）。没有 character_variants.json（旧项目/平台没出）时不拦。
 function prepareVariantDecisions(dir, map) {
   const state = { total: 0, built: 0, skipped: 0, pending: [], candidateFile: '', decisionFile: '', tableFile: '', candidates: [], decisions: [] };
-  const source = path.join(dir, 'character_variants.json');
-  if (!fs.existsSync(source)) return state;
-  let variantsJson;
-  try { variantsJson = JSON.parse(fs.readFileSync(source, 'utf8').replace(/^﻿/, '')); } catch { return state; }
-  const labels = Object.fromEntries([...(map.labels || new Map()).entries()].map(([key, value]) => [key, value?.to || '']));
-  const candidates = buildCandidates(variantsJson, nameResolver({ assetMap: { characters: map.characters, labels } }));
+  const candidates = collectVariantCandidates(dir, map);
   state.candidates = candidates;
   state.total = candidates.length;
   if (!candidates.length) return state;
@@ -1801,7 +1822,6 @@ function checkVariantsAgainstSource(scriptDir, sourceArg, usage) {
   const variantsFile = path.join(src, 'character_variants.json');
   const mapFile = path.join(src, ASSET_DIR, ASSET_MAP_FILE);
   const decisionFile = path.join(src, ASSET_DIR, VARIANT_DECISION_FILE);
-  if (!fs.existsSync(variantsFile)) { console.log('  · 分析稿目录里没有 character_variants.json，跳过变体漏建检查'); return; }
   if (!fs.existsSync(mapFile) || !fs.existsSync(decisionFile)) die(`还没做形象变体判定：先 chenyu-pro assets-apply --dir "${src}" 到 ASSETS_PASS`);
   const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
   const assetMap = normalizeAssetMap(readJson(mapFile));
@@ -1809,7 +1829,7 @@ function checkVariantsAgainstSource(scriptDir, sourceArg, usage) {
   // 洗稿换过名：判定表里是原名，剧本里是新名，按洗稿映射对上
   const renameFile = arg('map', '') ? path.resolve(arg('map')) : [path.join(scriptDir, '洗稿映射.json'), path.join(path.dirname(scriptDir), '洗稿映射.json')].find((file) => fs.existsSync(file));
   const renames = renameFile && fs.existsSync(renameFile) ? (readJson(renameFile).renames || {}) : {};
-  const baseCandidates = buildCandidates(readJson(variantsFile), nameResolver({ assetMap: { characters: assetMap.characters, labels } }));
+  const baseCandidates = collectVariantCandidates(src, assetMap);
   const scriptCandidates = baseCandidates.map((c) => ({ ...c, role: renames[c.role] || c.role }));
   const report = checkAgainstScript(scriptCandidates, readJson(decisionFile), usage);
   if (!report.total) { console.log('  · 平台没有记录到主造型以外的造型，无需核对'); return; }

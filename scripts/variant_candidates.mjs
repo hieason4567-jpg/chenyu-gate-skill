@@ -109,6 +109,51 @@ export function buildCandidates(variantsJson, resolve = (name) => ({ source: nam
   return candidates;
 }
 
+// 第二个证据来源：逐集分析表里每个镜头的「外观」原文。不依赖平台归并得对不对——
+// 平台把病号服错并进主造型、或者老项目没有 character_variants.json 时，强信号照样能被列出来。
+// looks: [{ episode: 'EP020', time, who, look }]（who 已是合并后的角色名）。
+// 一个信号占了这个角色一半以上的镜头或出场集，说明是他的常态（一直怀孕的孕妇、一直穿制服的警察、只出场一集的龙套），不算变体候选。
+export function scanAppearanceSignals(looks = [], { existing = [], scriptName = (name) => name } = {}) {
+  const byRole = new Map();
+  for (const item of looks) {
+    const who = String(item?.who || '').trim();
+    const n = epNumber(item?.episode);
+    if (!who || !n || /^OBS_/i.test(who)) continue;
+    const role = byRole.get(who) || { episodes: new Set(), signals: new Map(), rows: 0 };
+    role.episodes.add(n);
+    role.rows += 1;
+    for (const label of strongSignals(item.look)) {
+      const hit = role.signals.get(label) || { episodes: new Set(), samples: [], rows: 0, first: '' };
+      hit.episodes.add(n);
+      hit.rows += 1;
+      if (!hit.first) hit.first = `EP${String(n).padStart(3, '0')} ${item.time || ''}`.trim();
+      if (hit.samples.length < 3 && !hit.samples.includes(item.look)) hit.samples.push(String(item.look));
+      role.signals.set(label, hit);
+    }
+    byRole.set(who, role);
+  }
+  const out = [];
+  for (const [who, role] of byRole) {
+    const name = scriptName(who);
+    for (const [label, hit] of role.signals) {
+      // 常态：这个信号占了他一半以上的镜头（或一半以上的出场集）——一直穿制服的司机、只出场一集的铠甲武者，那就是他的主造型
+      if (hit.rows * 2 >= role.rows || hit.episodes.size * 2 > role.episodes.size) continue;
+      if (hit.rows < 2) continue; // 只有一个镜头提到，多半是瞬时状态或记错
+      const list = [...hit.episodes].sort((a, b) => a - b);
+      // 平台候选里已经有同一角色、同一信号、集数有重叠的，就不重复列
+      const covered = existing.some((c) => c.role === name && c.signals.includes(label) && c.episode_list.some((n) => hit.episodes.has(n)));
+      if (covered) continue;
+      out.push({
+        id: `${name}@${label}`, role: name, source_role: who, main_look: '',
+        look: label, description: hit.samples.join('；'), cause: '',
+        episodes: spanText(list), episode_list: list, first: hit.first, rows: hit.rows, signals: [label], from: 'rows'
+      });
+    }
+  }
+  out.sort((a, b) => a.role.localeCompare(b.role, 'zh') || (a.episode_list[0] || 0) - (b.episode_list[0] || 0));
+  return out;
+}
+
 export function renderCandidates(candidates, { title = '' } = {}) {
   const strong = candidates.filter((c) => c.signals.length);
   const lines = [
@@ -129,7 +174,7 @@ export function renderCandidates(candidates, { title = '' } = {}) {
   for (const c of candidates) {
     lines.push(`| ${cell(c.id)} | ${cell(c.role)}${c.source_role && c.source_role !== c.role ? `（分析稿里叫 ${cell(c.source_role)}）` : ''} | ${cell(c.look)}：${cell(c.description)} | ${cell(c.episodes)} | ${cell(c.first)} | ${c.rows} | ${cell(c.signals.join('、'))} | ${cell(c.cause)} |`);
   }
-  lines.push('', '主造型（不用表态）：', ...[...new Map(candidates.map((c) => [c.role, c.main_look])).entries()].map(([role, look]) => `- ${role}：${look}`));
+  lines.push('', '主造型（不用表态）：', ...[...new Map(candidates.filter((c) => c.main_look).map((c) => [c.role, c.main_look])).entries()].map(([role, look]) => `- ${role}：${look}`));
   return lines.join('\n') + '\n';
 }
 
