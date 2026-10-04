@@ -16,9 +16,13 @@ import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashM
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals } from './variant_candidates.mjs';
+import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.18.0 2026-10-04  人物合并复核：ASSETS_PASS 以前只查表填全了没有。现在合并后还剩下的称谓/职业/镜头描述式角色里戏份不小的
+//                    （3 句台词以上或跨 2 集以上），逐个要 Agent 确认——是某个具名角色就并掉、剧里有名字就改名、确实独立就写依据；
+//                    没处理完输出 ASSETS_REVIEW_PENDING。起因：68 集一稿通过后还剩 128 个职业/镜头标签，一人多标签被用户指出才合并。
 // v2.17.1 2026-10-04  形象变体候选多一路证据：直接扫逐集分析表每个镜头的外观原文里的强信号（病号服/包扎/婚纱/囚服/幼年/伪装…），
 //                    不依赖平台归并得对不对；老项目没有 character_variants.json 也能出候选。占了角色一半以上镜头的算常态，不列。只读，不改平台产物。
 // v2.17.0 2026-10-04  形象变体不再靠 Agent 凭记忆：assets-apply 在人物/场景/道具合并通过后，按平台的 character_variants.json 列出
@@ -166,7 +170,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.17.1';
+const VERSION = '2.18.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1730,6 +1734,16 @@ function cmdAssetsApply() {
   fs.writeFileSync(path.join(outDir, '资产合并表.md'), result.mapMarkdown, 'utf8');
   const s = result.stats;
   for (const w of [...checked.warnings, ...result.warnings]) console.log('  ⚠ ' + w);
+  // 人物合并复核：合并后还剩下的「称谓/职业/镜头描述式」角色里戏份不小的，逐个要依据（是不是某个具名角色、剧里有没有名字）。
+  const roleReview = prepareRoleReview(dir, result.dossierText);
+  if (roleReview.pending.length) {
+    console.log(`ASSETS_REVIEW_PENDING  表已填全（整理版已写出 -> ${outDir}），但还有 ${roleReview.pending.length}/${roleReview.total} 个称谓角色没复核——同一个人常被记成不同称呼，合并通过不等于合对了：`);
+    for (const line of roleReview.pending.slice(0, 30)) console.log('  ✗ ' + line);
+    if (roleReview.pending.length > 30) console.log(`  … 另有 ${roleReview.pending.length - 30} 个`);
+    console.log(`  先读 ${roleReview.reviewFile}（每个角色的出现集、台词样例、同集出场的具名角色），逐个判断：\n   · 是某个具名角色 → 回 资产合并表.json 并掉；剧里有名字 → 改成真名。重跑本命令后它会自动消失。\n   · 确实是没名字的独立角色 → 在 ${roleReview.decisionFile} 里填 decision=independent + reason。\n  全部处理完重跑本命令，直到 ASSETS_PASS。`);
+    process.exit(2);
+  }
+  if (roleReview.total) console.log(`  称谓角色复核 ${roleReview.total} 个已全部确认为独立角色（有依据）`);
   // 形象变体：分析结果一回来就定（和人物合并是同一步）。候选来自平台的 character_variants.json，每条都要表态，没表态完不给 PASS。
   const variantState = prepareVariantDecisions(dir, map);
   if (variantState.pending.length) {
@@ -1747,6 +1761,27 @@ function cmdAssetsApply() {
   console.log('  下一步：写作和洗稿都读 整理版/video_reverse_全剧合集.md；资产合并表.md 随稿交付。');
   if (variantState.built) console.log('  写每场【形象】时照 整理版/形象变体判定表.md：判定要建的变体，在它出现的那几集写 角色=变体名（原因）。写完跑 chenyu-pro variants --dir <剧本目录> --source <分析稿目录>，到 VARIANTS_PASS。');
   console.log(`  先存档（零积分，把合并结果留在平台项目里，换机器/换 Agent 接着做时能取回）：\n    chenyu-pro archive --project <项目id片段或剧名> --dir "${dir}"`);
+}
+
+// 称谓角色复核（assets-apply 调用）：在整理版合集上重新取证（说话人已换成合并后的名字）
+function prepareRoleReview(dir, mergedDossierText) {
+  const state = { total: 0, pending: [], reviewFile: '', decisionFile: '' };
+  let labels;
+  try { labels = [...collectAssetEvidence(parseDossier(mergedDossierText)).labels.values()]; } catch { return state; }
+  const items = rolesNeedingReview(labels);
+  state.total = items.length;
+  if (!items.length) return state;
+  const workDir = path.join(dir, ASSET_DIR);
+  fs.mkdirSync(workDir, { recursive: true });
+  state.reviewFile = path.join(workDir, ROLE_REVIEW_FILE);
+  state.decisionFile = path.join(workDir, ROLE_DECISION_FILE);
+  let existing = [];
+  if (fs.existsSync(state.decisionFile)) { try { existing = JSON.parse(fs.readFileSync(state.decisionFile, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${state.decisionFile} 不是合法 JSON：${e.message}`); } }
+  const decisions = roleDecisionTemplate(items, existing);
+  fs.writeFileSync(state.reviewFile, renderRoleReview(items, { totalRoles: labels.length, descriptiveRoles: labels.filter((x) => isDescriptiveName(x.name)).length }), 'utf8');
+  fs.writeFileSync(state.decisionFile, JSON.stringify(decisions, null, 1), 'utf8');
+  state.pending = pendingRoleReviews(items, decisions);
+  return state;
 }
 
 // 候选 = 平台归并好的造型（character_variants.json，可能没有）+ 逐集分析表每个镜头外观原文里的强信号（一定有）。
