@@ -20,6 +20,7 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.26.2 2026-10-04  标了建卡的道具都带 key（客户端导入时只建 key 的，之前 22 件只建了 8 件）；去掉「先建」名额上限和建卡数量建议。
 // v2.26.1 2026-10-04  去掉 v2.26.0 的数量上限和 --allow-many（群像戏、道具戏真有那么多就是那么多），改成按「是什么」识别：
 //                    没台词的单集背景人物不单独建角色；只差甲乙丙编号的同类龙套并成群体；
 //                    同一件东西的几个叫法只建一张卡；不同人各自拿的普通物件（手机、话筒、出租车）不建卡。群体名识别补上「人群／众XX／XX群」。
@@ -200,7 +201,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.26.1';
+const VERSION = '2.26.2';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2747,7 +2748,7 @@ function writePlacePropTask(kitDir, root, table, episodes, kit) {
     '',
     '## 道具建卡要克制（先看这一段）',
     `道具已按出现情况分了级（每条的 tier）：A=跨集反复出现的专属物件，要建卡，由你写外观；B=只在一两集起作用；C=随手用的普通物件。B、C 已经预填了 card:false 和原因，**默认不用动**。`,
-    `全剧建卡道具建议不超过 ${propBudget(new Set((table.places || []).flatMap((p) => String(p.episodes || '').split(/[、,，]/))).size || 0)} 件左右（约每 4 集 1 件）。建卡的道具越多，客户端出图越多、越花用户积分，前后也越容易不一致。`,
+    '建卡没有数量限制，按「是什么」判断：同一件东西只用一个名字、只建一张卡；不同的人各自拿的普通物件（手机、话筒、出租车、电脑）不建卡。标了建卡的，客户端导入时就全部建卡出图。',
     '只有同时满足「外观必须前后一致」和「观众会注意到它」的 B 级道具（信物、证据原件、标志性随身物），才把 card 改成 true 并写 description；水杯、盘子、文件夹、普通手机这类一律不建卡。',
     '',
     '## 二、输出格式',

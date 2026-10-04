@@ -174,8 +174,8 @@ export function propTiers(props, episodeCount) {
     else tiers.set(name, eps <= 1 && generic ? 'C' : 'B');
   }
   candidates.sort((a, b) => b[1] - a[1]);
-  const cap = propBudget(episodeCount);
-  candidates.forEach(([name], index) => tiers.set(name, index < cap ? 'A' : 'B'));
+  // 够条件的都是 A，不按集数限名额
+  candidates.forEach(([name]) => tiers.set(name, 'A'));
   return tiers;
 }
 
@@ -241,7 +241,8 @@ export function mergePlacePropDesigns(table, entries) {
     if (!e) { issues.push(`道具「${p.name}」没有设计（重跑 looks-prepare 补模板）`); continue; }
     issues.push(...placePropIssues(e));
     const d = e.design || {};
-    if (d.card === true || d.card === false) p.card = d.card;
+    // 判定了建卡的就标成 key：客户端导入时只建 key=true 的道具卡，不标的要等跑到那一集才建（已发布的客户端都是这样）
+    if (d.card === true || d.card === false) { p.card = d.card; p.key = d.card; }
     if (d.reason) p.reason = String(d.reason).trim(); // 不建卡的原因；或只出现一集却要建卡的原因
     if (d.card === true && String(d.description || '').trim()) Object.assign(p, { description: String(d.description).trim(), shortDescription: String(d.shortDescription || '').trim() });
   }
