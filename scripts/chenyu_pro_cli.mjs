@@ -14,10 +14,14 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
-import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.16.0 2026-10-04  ① 资产图：新命令 asset-image（按形象表列出可出图条目 → 用户点选 → 报价 → 平台出横版 16:9 资产图，约 6 分/张；
+//                    图下载到 资产图/ 并把位置写回形象表的 image 字段）。全部剧本和形象表完成后才问用户要不要出、出谁的。
+//                    ② 道具分级：形象表道具按 A 建卡 / B 剧情 / C 普通 分级，B、C 默认不建卡，建卡数量约每 4 集 1 件（超了提醒、不拦）。
+//                    54 集实测：200 件道具里默认建卡的从 200 件降到 14 件。
 // v2.15.0 2026-10-04  存档：新命令 archive（把资产合并表、整理版合集、检查报告等回传到平台项目留档，零积分，只做记录，不改原始分析稿和项目状态）
 //                    和 archive-fetch（换机器/换 Agent 接着做时取回）。分阶段存：ASSETS_PASS 后一次，全部交付前再一次。
 // v2.14.7 2026-10-04  SKILL.md 新增硬规则「做到交付为止，不要做完一步就停」：列明哪些情况不是停下的理由、哪几种才需要问用户。CLI 无功能变化。
@@ -155,7 +159,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.15.0';
+const VERSION = '2.16.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -261,7 +265,7 @@ async function ssoLoginWithKey() {
   } catch { return false; }
 }
 
-async function api(pathName, { method = 'GET', body, auth = true, base, _retried = false, retries = 4, timeoutMs = 30000 } = {}) {
+async function api(pathName, { method = 'GET', body, auth = true, base, _retried = false, retries = 4, timeoutMs = 30000, softFail = false } = {}) {
   let cfg = loadConfig();
   const url = (base || cfg.platform_base || DEFAULT_PLATFORM) + pathName;
   const headers = { 'Content-Type': 'application/json', 'User-Agent': CLI_UA };
@@ -296,11 +300,15 @@ async function api(pathName, { method = 'GET', body, auth = true, base, _retried
   if (res.status === 401 && auth) {
     // session 过期：用 KEY 自动续登一次再重试，仍不行才要求人工登录
     if (!_retried && await ssoLoginWithKey()) {
-      return api(pathName, { method, body, auth, base, _retried: true, retries, timeoutMs });
+      return api(pathName, { method, body, auth, base, _retried: true, retries, timeoutMs, softFail });
     }
     die('登录已失效——绑定了 KEY 会自动续登（刚已尝试失败），请检查 KEY 或重新 chenyu-pro login');
   }
-  if (!res.ok || data.ok === false || data.success === false) die(`${pathName} 失败(${res.status}): ${data.error || JSON.stringify(data).slice(0, 200)}`);
+  if (!res.ok || data.ok === false || data.success === false) {
+    // softFail：批量操作里单个失败不退出整个命令，由调用方记下来接着做下一个
+    if (softFail) return { ok: false, status: res.status, error: String(data.error || JSON.stringify(data).slice(0, 200)) };
+    die(`${pathName} 失败(${res.status}): ${data.error || JSON.stringify(data).slice(0, 200)}`);
+  }
   return data;
 }
 
@@ -378,6 +386,17 @@ async function cmdKey() {
   } else {
     console.log('积分 KEY: ' + mask(cfg.credit_key || ''));
   }
+}
+
+// 当前余额（取不到返回 null，不中断流程）
+async function currentCredits() {
+  try {
+    const cfg = loadConfig();
+    if (!cfg.credit_key) return null;
+    const res = await fetch((cfg.credit_base || DEFAULT_CREDIT_BASE) + '/api/jimeng/v1/key', { headers: { Authorization: 'Bearer ' + cfg.credit_key, 'User-Agent': CLI_UA }, signal: AbortSignal.timeout(20000) });
+    const n = Number((await res.json())?.key?.pointsBalance);
+    return Number.isFinite(n) ? n : null;
+  } catch { return null; }
 }
 
 async function cmdCredits() {
@@ -1756,6 +1775,124 @@ async function cmdArchive() {
   console.log(`  以后取回：chenyu-pro archive-fetch --project ${p.id.slice(-8)} --dir <分析稿目录>`);
 }
 
+// ---------- 资产图（消耗积分）：按形象表出横版资产图，用户点名出哪些 ----------
+// 图由平台出（和客户端同一条图片通道、同一套知识库版式提示词；16:9：角色=左半幅正脸特写+正面全身+背面全身，场景/道具=四格设定图），Agent 不碰提示词、不用自己的生图能力。
+// 出完的图：① 下载到 <形象表所在目录>/资产图/ 给用户看；② 存在平台项目里；③ 把图的位置写回形象表对应条目的 image 字段
+//（客户端导入形象表时据此取图挂到资产卡上，取不到就按原流程自己出）。
+const ASSET_IMAGE_DIR = '资产图';
+const ASSET_IMAGE_POINTS = 6; // 2026-10-04 实测：16:9、1080p、细节 low，和客户端资产图默认档一致
+const ASSET_IMAGE_KIND = { look: '角色', place: '场景', prop: '道具' };
+
+function loadLookTableOrDie(file) {
+  if (!fs.existsSync(file)) die(`没有找到形象表: ${file}\n  先完成形象设计并 chenyu-pro assets-export 出 形象表.json`);
+  let table;
+  try { table = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`形象表不是合法 JSON: ${e.message}`); }
+  if (table.schema !== 'chenyu.look-table/v1') die('这不是形象表（chenyu.look-table/v1）: ' + file);
+  return table;
+}
+
+// 可出图的条目：有完整外观描述的角色形象、有描述的场景、建卡(card:true)的道具。编号在同一张表上是稳定的。
+function assetImageCandidates(table) {
+  const items = [];
+  for (const c of table.characters || []) for (const l of c.looks || []) {
+    const prompt = String(l.styling?.description || l.design?.prompt || l.appearance || '').trim();
+    if (!prompt) continue;
+    items.push({ type: 'look', name: `${c.name}-${l.variant}`, owner: c.name, variant: l.variant, main: l.main === true, prompt, ref: l, episodes: l.episodes || c.episodes || '' });
+  }
+  for (const p of table.places || []) if (String(p.description || '').trim()) items.push({ type: 'place', name: p.name, prompt: String(p.description).trim(), ref: p, episodes: p.episodes || '' });
+  for (const p of table.props || []) if (p.card === true && String(p.description || '').trim()) items.push({ type: 'prop', name: p.name, prompt: String(p.description).trim(), ref: p, episodes: p.episodes || '' });
+  items.forEach((item, index) => { item.no = index + 1; });
+  return items;
+}
+
+async function cmdAssetImage() {
+  const dir = path.resolve(arg('dir', '.'));
+  const file = path.resolve(arg('look-table', path.join(dir, '形象表.json')));
+  const table = loadLookTableOrDie(file);
+  const items = assetImageCandidates(table);
+  if (!items.length) die('形象表里没有可出图的条目（角色形象要有外观描述；场景要有 description；道具要 card:true 且有 description）。先把形象设计、场景道具设计做完并 assets-export。');
+  const price = Number(arg('price', '')) || ASSET_IMAGE_POINTS;
+  const pickArg = String(arg('pick', '') || '').trim();
+  if (!pickArg) {
+    console.log(`《${table.title || '未命名'}》可出资产图的条目（横版 16:9，约 ${price} 分/张；已出过的标 ✓）：`);
+    for (const type of ['look', 'place', 'prop']) {
+      const group = items.filter((item) => item.type === type);
+      if (!group.length) continue;
+      console.log(`\n【${ASSET_IMAGE_KIND[type]}】${group.length} 个`);
+      for (const item of group) console.log(`  ${String(item.no).padStart(3)}. ${item.ref.image?.file ? '✓ ' : '  '}${item.name}${item.main ? '（主形象）' : ''}${item.episodes ? '  出现集 ' + item.episodes : ''}`);
+    }
+    console.log('\n把这张清单给用户看，问：要不要出资产图、出哪些（可以只出主角主形象）。用户选好后：');
+    console.log(`  chenyu-pro asset-image --project <项目> --look-table "${file}" --pick 1,3,7        先报价`);
+    console.log('  用户同意报价后同一条命令加 --yes。不要自己替用户全选，不要用你自己的生图能力代替（风格和客户端对不上）。');
+    return;
+  }
+  const picked = [];
+  for (const token of pickArg.split(/[,，\s]+/).filter(Boolean)) {
+    const range = token.match(/^(\d+)-(\d+)$/);
+    const found = range
+      ? items.filter((item) => item.no >= Number(range[1]) && item.no <= Number(range[2]))
+      : items.filter((item) => String(item.no) === token || item.name === token);
+    if (!found.length) die(`--pick 里的「${token}」在清单里找不到（不带 --pick 跑一次看编号）`);
+    for (const item of found) if (!picked.includes(item)) picked.push(item);
+  }
+  const redo = flag('force');
+  const todo = picked.filter((item) => redo || !item.ref.image?.file);
+  const skipped = picked.length - todo.length;
+  console.log(`已选 ${picked.length} 个${skipped ? `（其中 ${skipped} 个已出过图，跳过；要重出加 --force）` : ''}：${todo.map((item) => item.name).join('、') || '无'}`);
+  if (!todo.length) return;
+  console.log(`报价：${todo.length} 张 × 约 ${price} 分 = 约 ${todo.length * price} 分（以实际扣除为准，命令结束会打印）。`);
+  if (!flag('yes')) die('请把上面的清单和报价告诉用户，得到同意后同一条命令加 --yes');
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>（图存到哪个项目里）');
+  const p = await findProject(fragment);
+  const before = await currentCredits();
+  const outDir = path.join(path.dirname(file), ASSET_IMAGE_DIR);
+  fs.mkdirSync(outDir, { recursive: true });
+  const cfg = loadConfig();
+  let ok = 0;
+  const failed = [];
+  for (const item of todo) {
+    process.stdout.write(`  … ${ASSET_IMAGE_KIND[item.type]}「${item.name}」出图中`);
+    try {
+      const res = await api(`/api/projects/${p.id}/assets/generate-image`, {
+        method: 'POST', timeoutMs: 360000, retries: 0, softFail: true,
+        body: {
+          kind: ASSET_IMAGE_KIND[item.type], name: item.name, prompt: item.prompt, aspect_ratio: '16:9', force: redo,
+          ...(item.type === 'look' ? { base_character_name: item.owner, state_name: item.variant } : {}),
+          ...(arg('style', '') ? { visual_style: arg('style') } : {}),
+          prompt_template: 'client', // 和客户端资产卡同一套出图提示词（版式在知识库里）
+          save_scope: 'project', source_text: ''
+        }
+      });
+      const artifact = res?.artifact;
+      if (!artifact?.id) throw new Error(res?.error || '平台没有返回图片');
+      const bin = await fetch((cfg.platform_base || DEFAULT_PLATFORM) + `/api/artifacts/${artifact.id}/download`, {
+        headers: { Authorization: 'Bearer ' + loadConfig().session_token, 'User-Agent': CLI_UA }, signal: AbortSignal.timeout(120000)
+      });
+      if (!bin.ok) throw new Error(`图片下载失败 HTTP ${bin.status}`);
+      const buffer = Buffer.from(await bin.arrayBuffer());
+      const ext = (String(artifact.title || '').match(/\.(png|jpe?g|webp)$/i) || ['', 'png'])[1].toLowerCase();
+      const fileName = `${ASSET_IMAGE_KIND[item.type]}_${item.name.replace(/[\\/:*?"<>|\s]+/g, '_')}.${ext}`;
+      fs.writeFileSync(path.join(outDir, fileName), buffer);
+      item.ref.image = {
+        file: `${ASSET_IMAGE_DIR}/${fileName}`, project_id: p.id, artifact_id: artifact.id,
+        sha256: crypto.createHash('sha256').update(buffer).digest('hex'), bytes: buffer.length, ratio: '16:9', generated_at: new Date().toISOString()
+      };
+      fs.writeFileSync(file, JSON.stringify(table, null, 1), 'utf8'); // 出一张记一张，中途断了不丢
+      ok += 1;
+      console.log(`  ✓ ${fileName}（${Math.round(buffer.length / 1024)}KB）`);
+    } catch (e) {
+      failed.push(item.name);
+      console.log(`  ✗ ${String(e?.message || e).slice(0, 160)}`);
+    }
+  }
+  const after = await currentCredits();
+  console.log(`✓ 出图 ${ok}/${todo.length} 张 -> ${outDir}；图的位置已写回形象表（${path.basename(file)}）。`);
+  if (before != null && after != null) console.log(`  实际扣除 ${before - after} 分（同一账号同时有别的任务时，这个差额会把别的任务也算进来）`);
+  if (failed.length) { console.log(`  ⚠ 没出成的：${failed.join('、')}——原样告诉用户；要重试只对这几个再跑一次（失败的不扣分或已退分，以实际扣除为准）。`); process.exitCode = 2; }
+  console.log('  把图给用户看；用户不满意某张，用 --pick <编号> --force 重出那一张（再扣一次分，先问用户）。');
+  console.log(`  形象表改过了，交付前再存档一次：chenyu-pro archive --project ${p.id.slice(-8)} --dir <分析稿目录> --file "${file}"`);
+}
+
 // 取回存档：换机器 / 换 Agent / 上下文丢了之后接着做。只取「存档_」开头的文件，按原来的相对位置放回分析稿目录。
 async function cmdArchiveFetch() {
   const fragment = arg('project') || die('缺 --project <id片段或剧名>');
@@ -2032,6 +2169,11 @@ function writePlacePropTask(kitDir, root, table, episodes, kit) {
     '## 一、规则（知识库 asset.global_table.system；这里只用其中「道具与场景」「通话设备」两部分，人物/形象部分由形象设计负责）',
     kit.assetTableRules || '（kit.json 缺 assetTableRules：重跑 looks-prepare 取知识库）',
     '',
+    '## 道具建卡要克制（先看这一段）',
+    `道具已按出现情况分了级（每条的 tier）：A=跨集反复出现的专属物件，要建卡，由你写外观；B=只在一两集起作用；C=随手用的普通物件。B、C 已经预填了 card:false 和原因，**默认不用动**。`,
+    `全剧建卡道具建议不超过 ${propBudget(new Set((table.places || []).flatMap((p) => String(p.episodes || '').split(/[、,，]/))).size || 0)} 件左右（约每 4 集 1 件）。建卡的道具越多，客户端出图越多、越花用户积分，前后也越容易不一致。`,
+    '只有同时满足「外观必须前后一致」和「观众会注意到它」的 B 级道具（信物、证据原件、标志性随身物），才把 card 改成 true 并写 description；水杯、盘子、文件夹、普通手机这类一律不建卡。',
+    '',
     '## 二、输出格式',
     '场景：{"description":"80–180 个汉字的可搭建空间说明：布局、门窗墙地、固定家具、纵深；稀疏场景可做保守空间设计，不新增剧情实体","shortDescription":"4–18 字场景短标签","parentLocation":"所属物理地点（同一建筑/院落/机构/车辆填同一个名字，门口与室内同组但仍是不同场景）"}',
     '道具：{"card":true 或 false,"reason":"不建卡时写原因","description":"建卡时 50–140 个汉字的实体外观说明：材质、颜色、形状、尺寸、磨损、独特标记","shortDescription":"建卡时 4–18 字道具短标签"}',
@@ -2181,6 +2323,8 @@ async function cmdAssetsExport() {
       console.log(`  场景道具设计：场景 ${placeDone}/${(lookTable.places || []).length} 有描述；道具 ${decided}/${(lookTable.props || []).length} 已判定，其中建卡 ${cards} 件`);
       for (const x of ppIssues.slice(0, 30)) console.log('  ⚠ ' + x);
       if (ppIssues.length > 30) console.log(`  … 另有 ${ppIssues.length - 30} 处`);
+      const budget = propBudgetNote(lookTable);
+      console.log(`  ${budget.over ? '⚠' : '·'} ${budget.text}`);
       if (!ppIssues.length) console.log('  ✓ 场景道具设计齐全  ASSET_DESIGN_PASS');
       else { console.log(`  明细见上，改 ${PLACE_PROP_DESIGN_FILE} 后重跑  ASSET_DESIGN_FAIL`); process.exitCode = 2; }
     } catch (e) { console.log(`  ⚠ ${PLACE_PROP_DESIGN_FILE} 读不了：${e.message}`); }
@@ -2679,6 +2823,8 @@ function cmdHelp() {
   chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
   chenyu-pro video-analyze --project <id片段|剧名> --video-file 第4集.mp4  同一部剧追加到已有项目(人物跨集合并)
   chenyu-pro video-wait --project <id片段|剧名> [--out <目录>] [--timeout-min 8]  等分析跑完并自动取回(没跑完退出码3,再跑一次)
+  chenyu-pro asset-image --look-table <形象表.json>                         列出可出资产图的条目(零积分)
+  chenyu-pro asset-image --project <项目> --look-table <形象表.json> --pick 1,3 [--yes] [--force]  出横版资产图(约6分/张,先报价)
   chenyu-pro archive --project <id片段|剧名> --dir <分析稿目录> [--file a.md,b.json]  把合并表/整理版/检查报告存档到平台项目(零积分)
   chenyu-pro archive-fetch --project <id片段|剧名> --dir <分析稿目录> [--force]  取回存档接着做
   chenyu-pro video-fetch --project <id片段|剧名> [--out <目录>]  零积分重新取回最新分析稿(平台修复后用这个取)
@@ -2710,7 +2856,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);

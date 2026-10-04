@@ -143,9 +143,37 @@ export function lookTableJson({ people, creatureSet, casting, scenes: places = n
   // key=跨 2 集以上的道具（客户端先建卡），单集道具到那一集分集规划时按需建
   const placeList = [...places.entries()].sort((a, b) => Math.min(...a[1].eps) - Math.min(...b[1].eps))
     .map(([name, s]) => ({ name, times: [...s.times], episodes: span(s.eps) }));
+  const allEpisodes = new Set();
+  for (const s of places.values()) for (const n of s.eps) allEpisodes.add(n);
+  for (const pr of props.values()) for (const n of pr.eps) allEpisodes.add(n);
+  const tiers = propTiers(props, allEpisodes.size);
   const propList = [...props.entries()].sort((a, b) => Math.min(...a[1].eps) - Math.min(...b[1].eps))
-    .map(([name, pr]) => ({ name, key: pr.eps.size >= 2, owners: [...pr.owners], counts: [...pr.counts], states: [...pr.states].slice(0, 6), episodes: span(pr.eps) }));
+    .map(([name, pr]) => ({ name, tier: tiers.get(name), key: tiers.get(name) === 'A', owners: [...pr.owners], counts: [...pr.counts], states: [...pr.states].slice(0, 6), episodes: span(pr.eps) }));
   return { schema: 'chenyu.look-table/v1', title, characters, scenes, places: placeList, props: propList };
+}
+
+// 道具分级（2026-10-04）：以前剧本【道具】行里写过的每样东西都进表、都要设计建卡——54 集出过 200 件道具，
+// 其中 134 件只出现 1 集（玻璃水杯、红色盘子、黑色文件夹），跨 4 集以上的只有 12 件。
+//   A 建卡道具：跨集反复出现、有专属名字的物件 → 先建卡、要写外观、可出图；有数量上限（约每 4 集 1 件）
+//   B 剧情道具：只在一两集起作用 → 留在表里，默认不建卡；确实要固定外观的，Agent 在设计里把 card 改成 true
+//   C 普通物件：随手用的通用东西，只出现一集 → 默认不建卡
+// 这里只按出现集数和名字做默认分级，是建议不是结论：Agent 可以在「场景道具设计.json」里改 card。
+const GENERIC_PROP_RE = /(手机|电话|水杯|茶杯|杯子|玻璃杯|酒杯|茶壶|水壶|碗|盘子|碟子|筷子|勺子|文件夹|文件袋|纸巾|毛巾|水桶|脸盆|椅子|凳子|桌子|钱包|背包|挎包|雨伞|钢笔|圆珠笔|签字笔|白纸|电脑|笔记本电脑|平板|遥控器|香烟|打火机|水瓶|矿泉水|饭盒|托盘|垃圾袋|购物袋|塑料袋|纸箱|抹布|拖把|扫帚)$/;
+export const propBudget = (episodeCount) => Math.max(8, Math.ceil(Number(episodeCount || 0) / 4));
+export function propTiers(props, episodeCount) {
+  const tiers = new Map();
+  const candidates = [];
+  for (const [name, pr] of props) {
+    const eps = pr.eps.size;
+    // 名字是通用物件，但全剧出现 6 集以上且有固定主人的，是这个人的标志性随身物（「银饰挎包」44 集），不算普通物件
+    const generic = GENERIC_PROP_RE.test(name) && name.length <= 8 && !(eps >= 6 && pr.owners.size >= 1);
+    if (!generic && (eps >= 3 || (eps >= 2 && pr.owners.size >= 1))) candidates.push([name, eps]);
+    else tiers.set(name, eps <= 1 && generic ? 'C' : 'B');
+  }
+  candidates.sort((a, b) => b[1] - a[1]);
+  const cap = propBudget(episodeCount);
+  candidates.forEach(([name], index) => tiers.set(name, index < cap ? 'A' : 'B'));
+  return tiers;
 }
 
 // 场景道具设计（和客户端全局资产表同一套规则，知识库 asset.global_table.system）：
@@ -163,8 +191,12 @@ export function placePropTemplate(table, existing = [], inputs = new Map()) {
   }
   for (const p of table.props || []) {
     const prev = old.get(`prop=${p.name}`);
-    rows.push({ type: 'prop', name: p.name, input: inputs.get(`prop=${p.name}`) || { owners: p.owners, states: p.states, episodes: p.episodes },
-      design: prev?.design || { card: null, reason: '', description: '', shortDescription: '' } });
+    // 只有 A 级留空让 Agent 写外观；B/C 级默认不建卡（预填 card:false + 原因），确实要固定外观的再改成 true 并写 description
+    const preset = p.tier === 'A' || !p.tier
+      ? { card: null, reason: '', description: '', shortDescription: '' }
+      : { card: false, reason: p.tier === 'C' ? '普通物件，不需要固定外观' : '只在一两集出现，不需要统一外观', description: '', shortDescription: '' };
+    rows.push({ type: 'prop', name: p.name, tier: p.tier || '', input: inputs.get(`prop=${p.name}`) || { owners: p.owners, states: p.states, episodes: p.episodes },
+      design: prev?.design || preset });
   }
   return rows;
 }
@@ -211,6 +243,23 @@ export function mergePlacePropDesigns(table, entries) {
     if (d.card === true && String(d.description || '').trim()) Object.assign(p, { description: String(d.description).trim(), shortDescription: String(d.shortDescription || '').trim() });
   }
   return issues;
+}
+
+// 建卡道具数量提醒（只提醒，不算不通过）：建卡的越多，客户端出图越多、越花用户积分，也越容易前后不一致。
+export function propBudgetNote(table) {
+  const props = table.props || [];
+  const episodes = new Set();
+  for (const p of [...(table.places || []), ...props]) for (const part of String(p.episodes || '').split(/[、,，]/)) {
+    const m = part.trim().match(/^(\d+)(?:[–\-~至](\d+))?$/);
+    if (m) for (let n = Number(m[1]); n <= Number(m[2] || m[1]); n += 1) episodes.add(n);
+  }
+  const cap = propBudget(episodes.size);
+  const carded = props.filter((p) => p.card === true);
+  const line = `道具 ${props.length} 件：建卡 ${carded.length} 件（建议不超过 ${cap} 件，约每 4 集 1 件），不建卡 ${props.filter((p) => p.card === false).length} 件`;
+  if (carded.length <= cap) return { over: false, text: line };
+  const weakest = carded.map((p) => ({ name: p.name, eps: String(p.episodes || '').split(/[、,，]/).filter(Boolean).length, tier: p.tier || '' }))
+    .sort((a, b) => (a.tier === 'A' ? 1 : 0) - (b.tier === 'A' ? 1 : 0) || a.eps - b.eps).slice(0, carded.length - cap).map((p) => p.name);
+  return { over: true, text: `${line}\n  建卡道具偏多。只给「跨集反复出现、外观必须前后一致」的物件建卡；下面这些出现最少，考虑改成 card:false：\n  ${weakest.join('、')}` };
 }
 
 // 形象表体检：没写外观的形象、非主形象没写原因
