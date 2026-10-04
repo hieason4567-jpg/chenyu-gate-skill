@@ -18,6 +18,9 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.5 2026-10-04  取回分析稿后明确告诉 Agent「完不完整、下一步谁做什么」：video-fetch / video-analyze 结尾统一打印完整性结论
+//                    （共几集、缺哪几集、哪几集没内容）；平台状态 needs_review 且没有失败集 = 分析完整、只是人物还没归属，
+//                    下一步是 Agent 自己做资产整理（零积分），不是重新分析。SKILL.md 同步写明这一步由 Agent 做。
 // v2.14.4 2026-10-04  集号取错修复：「9月15日-2.mp4」这类带日期前缀的文件名以前每个都被取成第 9 集，补失败集时被编到最后（EP072–EP088）。
 //                    现在末尾的 -N 优先；追加到已有项目却取不到集号、而项目里还有缺集时停下不传；新参数 --episodes 2,3,5 直接指定集号。
 // v2.14.3 2026-10-03  自带 ffmpeg 下载源加泉州节点（国内直连几秒下完，不用代理），对象存储做备用。
@@ -146,7 +149,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.4';
+const VERSION = '2.14.5';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1144,6 +1147,66 @@ async function downloadVideoAnalysis(pid, outDir) {
   return { got, badSegments };
 }
 
+// 取回的分析稿完不完整：按 episode_index.json 逐集看（有没有分析段、有没有剧情摘要）。纯本地读文件。
+function analysisCompleteness(outDir) {
+  try {
+    const episodes = JSON.parse(fs.readFileSync(path.join(outDir, 'episode_index.json'), 'utf8')).episodes || [];
+    const numbers = episodes.map((ep) => Number((String(ep.episode_id || '').match(/(\d+)/) || [])[1])).filter(Number.isFinite);
+    const top = numbers.length ? Math.max(...numbers) : 0;
+    const have = new Set(numbers);
+    const gaps = [];
+    for (let n = 1; n <= top; n += 1) if (!have.has(n)) gaps.push(n);
+    const empty = episodes.filter((ep) => !(ep.segment_ids || []).length || !(ep.summaries || []).join('').trim()).map((ep) => String(ep.episode_id));
+    return { known: true, count: episodes.length, gaps, empty };
+  } catch { return { known: false, count: 0, gaps: [], empty: [] }; }
+}
+
+// 打印「完不完整 + 下一步」（video-fetch / video-analyze 共用）。jobState: { status, failed: [段号] }。返回 true = 可以往下做资产整理。
+// 背景：平台状态 needs_review 且没有失败段 = 分析完整、只是人物还没归属。2026-10-04 有 Agent 把它当成故障，打算花 300~480 分重跑。
+function printAnalysisVerdict({ outDir, pid, jobState = {}, badSegments = [] }) {
+  const c = analysisCompleteness(outDir);
+  const failed = jobState.failed || [];
+  const problems = [];
+  if (failed.length) problems.push(`平台还有没分析成功的段：${failed.join(', ')}`);
+  if (c.gaps.length) problems.push(`集号不连续，缺第 ${c.gaps.join('、')} 集（如果本来就只分析后面的集，可忽略这一条）`);
+  if (c.empty.length) problems.push(`这些集没有分析内容或剧情摘要：${c.empty.join(', ')}`);
+  if (badSegments.length) problems.push(`这些段缺画面动作/镜头表：${badSegments.join('；')}`);
+  console.log('── 分析稿完整性 ──');
+  if (!c.known) {
+    console.log('  ⚠ 没读到 episode_index.json，无法判断集数。重新取一次：chenyu-pro video-fetch --project ' + pid.slice(-8));
+    return false;
+  }
+  if (problems.length) {
+    console.log(`  共 ${c.count} 集。⛔ 不完整：\n   - ${problems.join('\n   - ')}`);
+    console.log(`  全部集都有结果才能往下写。只补缺的集（已成功的不会重复扣分）：\n    chenyu-pro video-analyze --project ${pid.slice(-8)} --video-file <缺的集.mp4,逗号分隔> --episodes <对应集号,逗号分隔> --yes\n  补了仍缺，把上面的清单原样告诉用户，由平台核实；不要自己绕过、不要重新提交整批视频。`);
+    return false;
+  }
+  console.log(`  ✓ 结论：完整。共 ${c.count} 集，每集都有分析内容和剧情摘要，没有失败的集。可以进入下一步。`);
+  if (String(jobState.status || '') === 'needs_review') {
+    console.log('  ℹ 平台状态是 needs_review（人物身份待核）属于正常：平台只看画面，同一个人在不同集可能被记成不同的临时编号（OBS_ 开头）。');
+    console.log('    这不是缺内容——不要重新分析、不要重新提交视频、不要为此花积分。人物归属由你在下一步资产整理里按剧情确定。');
+  }
+  console.log('  下一步由你(Agent)完成，零积分、纯本地，按顺序做：');
+  console.log(`   1) chenyu-pro assets-prepare --dir "${outDir}"   生成人物证据卡/场景清单/道具清单/台词清单 + 待填的资产合并表`);
+  console.log('   2) 通读后按剧情填表：同一个人全剧一个名字、同一地点一个场景、只留关键道具；被喊的对象≠说话人，逐句核对');
+  console.log(`   3) chenyu-pro assets-apply --dir "${outDir}"     到 ASSETS_PASS，出 整理版/video_reverse_全剧合集.md`);
+  console.log('   4) 之后才是用户要的事：照整理版逐集写 / 给洗稿改编建议；');
+  console.log(`      写完过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
+  return true;
+}
+
+// 项目最近一次视频分析任务的状态（给完整性结论用）
+async function latestAnalysisJobState(pid) {
+  try {
+    const jobs = (await api(`/api/projects/${pid}/jobs`)).jobs || [];
+    const job = jobs.find((j) => /video_reverse/.test(String(j.job_type || j.type || '')));
+    if (!job) return {};
+    let rj = job.result_json || {};
+    if (typeof rj === 'string') { try { rj = JSON.parse(rj); } catch { rj = {}; } }
+    return { status: String(job.status || ''), failed: (Array.isArray(rj.failed_segments) ? rj.failed_segments : []).map((item) => item.segment_id).filter(Boolean) };
+  } catch { return {}; }
+}
+
 // 零积分：重新取回某个项目最新的分析稿（平台修复、追加分析后用这个取，不要重新提交视频）。
 async function cmdVideoFetch() {
   const fragment = arg('project') || die('缺 --project <id片段或剧名>');
@@ -1156,11 +1219,8 @@ async function cmdVideoFetch() {
   const { got, badSegments } = await downloadVideoAnalysis(target.id, outDir);
   if (!got) die(`项目《${target.title}》还没有分析稿`);
   console.log(`✓ 已取回《${target.title}》最新分析稿 ${got} 个文件 -> ${outDir}（零积分）`);
-  if (badSegments.length) {
-    console.log(`⛔ 以下段分析稿仍不完整：\n  ${badSegments.join('\n  ')}\n  这几集先不要写，原样告诉用户，由平台核实处理；不要重新提交整批视频（会重复扣分）。`);
-  } else {
-    console.log(`✓ 各段分析稿完整。动笔前先整理资产：chenyu-pro assets-prepare --dir "${outDir}"（填好合并表后 assets-apply）。`);
-  }
+  const ok = printAnalysisVerdict({ outDir, pid: target.id, jobState: await latestAnalysisJobState(target.id), badSegments });
+  if (!ok) process.exitCode = 2;
 }
 
 // 重建人物身份和资产表：用平台上已保存的逐段分析结果重新审计人物、重新整理资产，不重看视频、不扣视频分。
@@ -1522,13 +1582,9 @@ async function cmdVideoAnalyze() {
       `  补了仍失败，把上面的缺集清单原样告诉用户，由平台核实。`);
     process.exitCode = 2;
   }
-  if (identityOnly) console.log('ℹ 分析完整。平台标记"人物身份待核"（单包分析常见，不是缺内容）——人物归属在下一步资产整理里由你按剧情确定，无需重交。');
-  console.log('  下一步（零积分）：先整理资产，再动笔。');
-  console.log(`   1) chenyu-pro assets-prepare --dir "${outDir}"   生成人物证据卡/场景清单/道具清单 + 待填的资产合并表`);
-  console.log('   2) 你(Agent)通读后按剧情填表：同一个人全剧一个名字、同一地点一个场景、只留关键道具');
-  console.log(`   3) chenyu-pro assets-apply --dir "${outDir}"     到 ASSETS_PASS，出 整理版/video_reverse_全剧合集.md`);
-  console.log('   4) 照整理版的逐集分析表逐集写；');
-  console.log(`      过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
+  if (partial) return; // 上面已经说明缺哪几集、怎么补
+  const ok = printAnalysisVerdict({ outDir, pid, jobState: { status: identityOnly ? 'needs_review' : 'completed', failed: [] }, badSegments });
+  if (!ok) process.exitCode = 2;
 }
 
 // ───────────── 资产整理（纯本地、零积分、不联网）─────────────
