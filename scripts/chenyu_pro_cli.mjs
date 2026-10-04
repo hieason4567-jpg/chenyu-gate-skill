@@ -20,6 +20,8 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.19.1 2026-10-04  资产整理做完是必停节点：ASSETS_PASS 后停下来向用户汇报并问要哪种稿，用户确认才动笔
+//                    （之前「不要做完一步就停」的规则把 Agent 推过了头，没问就写了 68 集 1:1 剧本）。一开始就说明要哪种稿的除外。
 // v2.19.0 2026-10-04  复核可以多代理并行：review-split 把待处理的称谓角色和形象变体按集数分包，每包自带相关镜头行原文和结论格式，
 //                    子代理各做一包只写结论；review-merge 统一落地（并人/改名写进合并表，独立/变体写进判定表），拿不准的留给主 Agent。
 // v2.18.0 2026-10-04  人物合并复核：ASSETS_PASS 以前只查表填全了没有。现在合并后还剩下的称谓/职业/镜头描述式角色里戏份不小的
@@ -172,7 +174,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.19.0';
+const VERSION = '2.19.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1225,11 +1227,11 @@ function printAnalysisVerdict({ outDir, pid, jobState = {}, badSegments = [] }) 
     console.log('  ℹ 平台状态是 needs_review（人物身份待核）属于正常：平台只看画面，同一个人在不同集可能被记成不同的临时编号（OBS_ 开头）。');
     console.log('    这不是缺内容——不要重新分析、不要重新提交视频、不要为此花积分。人物归属由你在下一步资产整理里按剧情确定。');
   }
-  console.log('  下一步由你(Agent)完成，零积分、纯本地，按顺序做：');
+  console.log('  下一步由你(Agent)完成，零积分、纯本地，按顺序做（做到第 3 步停下来问用户）：');
   console.log(`   1) chenyu-pro assets-prepare --dir "${outDir}"   生成人物证据卡/场景清单/道具清单/台词清单 + 待填的资产合并表`);
   console.log('   2) 通读后按剧情填表：同一个人全剧一个名字、同一地点一个场景、只留关键道具；被喊的对象≠说话人，逐句核对');
   console.log(`   3) chenyu-pro assets-apply --dir "${outDir}"     到 ASSETS_PASS，出 整理版/video_reverse_全剧合集.md`);
-  console.log('   4) 之后才是用户要的事：照整理版逐集写 / 给洗稿改编建议；');
+  console.log('   4) 到 ASSETS_PASS 后停下来向用户汇报资产整理结果，问要哪种稿（1:1 还原／只改名／洗稿／先出洗稿建议）；用户确认后才逐集写。');
   console.log(`      写完过 gate 后 chenyu-pro save --project ${pid.slice(-8)} --episode N --file 第00N集.txt`);
   return true;
 }
@@ -1760,7 +1762,9 @@ function cmdAssetsApply() {
   console.log(`  说话人 ${s.speakers_before} 种 -> ${s.speakers_after} 种（换名 ${s.speakers_changed} 行，其中逐句指定 ${s.line_overrides} 行）`);
   console.log(`  正式人物 ${s.characters} 个；场景 ${s.scene_writings} 种写法 -> ${s.scenes} 个；关键道具 ${s.key_props} 件；待核编号 ${s.unresolved_labels} 个；残留未处理编号 ${s.residual_observation_ids}`);
   console.log(`  台词列、字幕列、镜头列逐行核对一致（${s.rows} 行）`);
-  console.log('  下一步：写作和洗稿都读 整理版/video_reverse_全剧合集.md；资产合并表.md 随稿交付。');
+  console.log('  ■ 资产整理到此完成。先存档，然后【停下来向用户汇报】：整理出多少角色/场景/关键道具、哪几条还拿不准，并问下一步要哪种——');
+  console.log('    1:1 还原成剧本 ／ 只改角色名 ／ 洗稿换设定 ／ 先出洗稿建议。用户明确选了才动笔（一开始就说明了要哪种稿的除外）。不要顺手把剧本写了。');
+  console.log('  用户确认要写之后：写作和洗稿都读 整理版/video_reverse_全剧合集.md；资产合并表.md 随稿交付。');
   if (variantState.built) console.log('  写每场【形象】时照 整理版/形象变体判定表.md：判定要建的变体，在它出现的那几集写 角色=变体名（原因）。写完跑 chenyu-pro variants --dir <剧本目录> --source <分析稿目录>，到 VARIANTS_PASS。');
   console.log(`  先存档（零积分，把合并结果留在平台项目里，换机器/换 Agent 接着做时能取回）：\n    chenyu-pro archive --project <项目id片段或剧名> --dir "${dir}"`);
 }
