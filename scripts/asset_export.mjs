@@ -118,7 +118,7 @@ export function assetListJson({ people, scenes, props, creatureSet }) {
     props: [...props.entries()].map(([name, pr]) => ({ name, owners: [...pr.owners], states: [...pr.states], counts: [...pr.counts], episodes: [...pr.eps].sort((a, b) => a - b) }))
   };
 }
-const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$|群$|人群|一群|一众|众人|(?<![观听公大民受])众[一-龥]{1,3}$/;
+const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$|群$|人群|群众|围观[一-龥]{1,3}$|一群|一众|众人|(?<![观听公大民受])众[一-龥]{1,3}$/;
 // 建卡原因里承认「它和另一件道具是同一样东西」的说法
 const SAME_ENTITY_RE = /同一(?:实体|件|台|个|把|辆|本|机)|为同[一场]|沿用.{0,12}外观|复用|后续称谓|另一(?:种)?(?:称谓|叫法)/;
 const CREATURE_RE = /蛊|虫|蛾|蟾|蛙|螳螂|蜂|蛛|蝶|鸭|鹅|鸵鸟|鸟|兽|蛇|狐|猫|狗|犬|兔|龟|鼠|狼|熊/;
@@ -256,13 +256,9 @@ export function propBudgetNote(table) {
     const m = part.trim().match(/^(\d+)(?:[–\-~至](\d+))?$/);
     if (m) for (let n = Number(m[1]); n <= Number(m[2] || m[1]); n += 1) episodes.add(n);
   }
-  const cap = propBudget(episodes.size);
+  // 只报数，不按数量判多少：该不该建卡由 lookTableCompleteness 按「是什么」逐件识别
   const carded = props.filter((p) => p.card === true);
-  const line = `道具 ${props.length} 件：建卡 ${carded.length} 件（建议不超过 ${cap} 件，约每 4 集 1 件），不建卡 ${props.filter((p) => p.card === false).length} 件`;
-  if (carded.length <= cap) return { over: false, text: line };
-  const weakest = carded.map((p) => ({ name: p.name, eps: String(p.episodes || '').split(/[、,，]/).filter(Boolean).length, tier: p.tier || '' }))
-    .sort((a, b) => (a.tier === 'A' ? 1 : 0) - (b.tier === 'A' ? 1 : 0) || a.eps - b.eps).slice(0, carded.length - cap).map((p) => p.name);
-  return { over: true, text: `${line}\n  建卡道具偏多。只给「跨集反复出现、外观必须前后一致」的物件建卡；下面这些出现最少，考虑改成 card:false：\n  ${weakest.join('、')}` };
+  return { over: false, text: `道具 ${props.length} 件：建卡 ${carded.length} 件，不建卡 ${props.filter((p) => p.card === false).length} 件` };
 }
 
 // 变体名是「颜色/材质 + 衣服」这种服装名（灰黑长衫、藏蓝上衣）。事件类的着装名（病号服、滑雪服、婚纱…）合规。
