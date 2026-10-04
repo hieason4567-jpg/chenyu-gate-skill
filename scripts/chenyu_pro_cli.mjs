@@ -20,6 +20,7 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.28.0 2026-10-05  视频反推的剧本带原片运镜：△（近景·推）……。1:1 还原每个 △ 都带；洗稿/只改名只带运镜在讲故事的镜头（揭示、情绪特写、仰俯、钩子卡点、转场），普通对话镜头不带。
 // v2.27.0 2026-10-04  视频反推标准流程：反推 → 交付资产整理 → 给洗稿建议 → 停 → 用户修改或确认 → 才写洗稿剧本。
 //                    洗稿映射.json 草稿写 "confirmed": false，未确认时 rename / wash-check 拒绝执行；洗稿建议有了标准内容。
 // v2.26.2 2026-10-04  标了建卡的道具都带 key（客户端导入时只建 key 的，之前 22 件只建了 8 件）；去掉「先建」名额上限和建卡数量建议。
@@ -203,7 +204,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.27.0';
+const VERSION = '2.28.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
