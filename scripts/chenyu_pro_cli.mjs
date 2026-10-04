@@ -20,7 +20,11 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
-// v2.26.0 2026-10-04  形象表数量上限：角色超过「集数×1.2（至少 30）」、建卡道具超过「集数÷2（至少 12）」时 LOOK_TABLE_INCOMPLETE，
+// v2.26.1 2026-10-04  去掉 v2.26.0 的数量上限和 --allow-many（群像戏、道具戏真有那么多就是那么多），改成按「是什么」识别：
+//                    没台词的单集背景人物不单独建角色；只差甲乙丙编号的同类龙套并成群体；
+//                    同一件东西的几个叫法只建一张卡；不同人各自拿的普通物件（手机、话筒、出租车）不建卡。群体名识别补上「人群／众XX／XX群」。
+//                    确实要保留的在「保留说明.json」里写 名字: 原因。
+// v2.26.0 2026-10-04  形象表数量上限（已在 v2.26.1 撤掉）：角色超过「集数×1.2（至少 30）」、建卡道具超过「集数÷2（至少 12）」时 LOOK_TABLE_INCOMPLETE，
 //                    要求把同场同类的龙套并成群体角色、把只出现一两集的道具改成不建卡（--allow-many 可放行）；不建卡的道具不再写进形象表。
 //                    起因：一部 68 集的表导出了 188 个角色（114 个单集龙套）、72 件建卡道具，客户端要各建一张卡各出一张图。
 // v2.25.0 2026-10-04  链路排查后的一批修复：① 资产整理/分包/存档等命令不传 --dir 时用最近一次取回的分析稿目录；② video-analyze 等到超时不再按「已完成」往下走；
@@ -196,7 +200,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.26.0';
+const VERSION = '2.26.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2235,7 +2239,7 @@ function cmdDeliver() {
   if (lookTableFile) {
     let table = null;
     try { table = JSON.parse(fs.readFileSync(lookTableFile, 'utf8').replace(/^\uFEFF/, '')); } catch { /* 读不了按不完整处理 */ }
-    const gaps = !table ? ['文件读不了'] : table.complete === true ? [] : lookTableCompleteness(table, { episodes: episodeFiles.map((file) => episodeNoOfFile(path.basename(file))), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props'), allowMany: flag('allow-many') });
+    const gaps = !table ? ['文件读不了'] : table.complete === true ? [] : lookTableCompleteness(table, { episodes: episodeFiles.map((file) => episodeNoOfFile(path.basename(file))), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props'), keep: readKeepNotes(path.dirname(lookTableFile)) });
     if (gaps.length) {
       lookTableNote = `⛔ 形象表不完整（${gaps.length} 项），没有放进交付目录：\n     ✗ ${gaps.slice(0, 8).join('\n     ✗ ')}\n     补完重跑 assets-export 到 LOOK_TABLE_PASS，再重新 deliver。不要把不完整的形象表交给用户。`;
       lookTableFile = '';
@@ -2822,6 +2826,10 @@ const STYLING_AUDIT_HINTS = [
   [/unknown exact catalog ID/, 'wardrobeCapsuleId 不在形象库里（先跑 looks-prepare 取云端形象库）'],
   [/classification missing/, '缺 classification（roleDomain/roleTags）'],
 ];
+// 保留说明.json（和形象表放一起）：{ "角色名": "为什么这个没台词的单集人物也要单独建卡" }
+function readKeepNotes(dir) {
+  try { const notes = JSON.parse(fs.readFileSync(path.join(dir, '保留说明.json'), 'utf8').replace(/^﻿/, '')); return notes && typeof notes === 'object' ? notes : {}; } catch { return {}; }
+}
 // assets-export 一次运行里各项审核的结果：形象表完不完整要一起看
 const exportState = { stylingAudit: '', designProblems: 0 };
 async function auditStylingLikeClient(lookTable, kitDir) {
@@ -2908,7 +2916,7 @@ async function cmdAssetsExport() {
   }
   // 完整性：客户端只收这一张表，缺什么客户端里就缺什么。不完整的表不叫「形象表.json」，免得被当成成品交出去。
   const draftFile = path.join(path.dirname(lookFile), '形象表.未完成.json');
-  const incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props'), allowMany: flag('allow-many') });
+  const incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props'), keep: readKeepNotes(path.dirname(lookFile)) });
   if (EDITION !== 'gate') {
     if (exportState.stylingAudit === 'fail') incomplete.push('客户端造型审核没通过（STYLING_AUDIT_FAIL）：这样的形象上传后会被客户端打回、重调模型扣用户积分，按上面的明细改「形象设计.json」');
     if (exportState.designProblems) incomplete.push(`场景道具设计还有 ${exportState.designProblems} 处问题（ASSET_DESIGN_FAIL）：按上面的明细改「场景道具设计.json」`);

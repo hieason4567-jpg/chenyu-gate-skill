@@ -118,7 +118,9 @@ export function assetListJson({ people, scenes, props, creatureSet }) {
     props: [...props.entries()].map(([name, pr]) => ({ name, owners: [...pr.owners], states: [...pr.states], counts: [...pr.counts], episodes: [...pr.eps].sort((a, b) => a - b) }))
   };
 }
-const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$/;
+const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$|群$|人群|一群|一众|众人|(?<![观听公大民受])众[一-龥]{1,3}$/;
+// 建卡原因里承认「它和另一件道具是同一样东西」的说法
+const SAME_ENTITY_RE = /同一(?:实体|件|台|个|把|辆|本|机)|为同[一场]|沿用.{0,12}外观|复用|后续称谓|另一(?:种)?(?:称谓|叫法)/;
 const CREATURE_RE = /蛊|虫|蛾|蟾|蛙|螳螂|蜂|蛛|蝶|鸭|鹅|鸵鸟|鸟|兽|蛇|狐|猫|狗|犬|兔|龟|鼠|狼|熊/;
 const HUMAN_LOOK_RE = /男|女|老人|老者|孩|西装|衬衫|外套|大衣|长袍|裙|裤|头发|盘发|短发|长发|辫/;
 
@@ -240,7 +242,7 @@ export function mergePlacePropDesigns(table, entries) {
     issues.push(...placePropIssues(e));
     const d = e.design || {};
     if (d.card === true || d.card === false) p.card = d.card;
-    if (d.card === false && d.reason) p.reason = String(d.reason).trim();
+    if (d.reason) p.reason = String(d.reason).trim(); // 不建卡的原因；或只出现一集却要建卡的原因
     if (d.card === true && String(d.description || '').trim()) Object.assign(p, { description: String(d.description).trim(), shortDescription: String(d.shortDescription || '').trim() });
   }
   return issues;
@@ -274,7 +276,7 @@ const PLACE_LIKE_NAME_RE = /^(前台|礼宾台?|吧台|柜台|收银台|服务�
 // 2026-10-04：一张表道具清单是空的（剧本没写【道具】行），导进客户端后道具 0 件；同一张表形象名全是服装名。
 // 导出时文件照写、只打了警告，Agent 就把它交了。现在不完整的表不叫「形象表.json」，交付命令也不收。
 // episodes = 剧本实际有的集号；requireDesign = 完整版要做场景/道具设计，免费版不做。返回缺项清单，空 = 完整。
-export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false, allowMany = false } = {}) {
+export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false, keep = {} } = {}) {
   const issues = [];
   const chars = table.characters || [];
   if (!chars.length) issues.push('没有任何角色形象：剧本每场要有【形象】行');
@@ -309,32 +311,59 @@ export function lookTableCompleteness(table, { episodes = [], requireDesign = tr
     const cardNoDesc = props.filter((p) => p.card === true && !String(p.description || '').trim());
     if (cardNoDesc.length) issues.push(`${cardNoDesc.length} 件要建卡的道具没有外观描述：${cardNoDesc.slice(0, 6).map((p) => p.name).join('、')}${cardNoDesc.length > 6 ? ' 等' : ''}`);
   }
-  // 数量上限（2026-10-04）：一部 68 集的表导出了 188 个角色（114 个只出现一集的龙套）、72 件建卡道具——
-  // 客户端按表每个角色、每件建卡道具各建一张卡、各出一张图，全是用户的成本，而且卡越多越容易前后不一致。
-  // 确实是群像戏、道具戏的，加 --allow-many 导出，并把数量如实告诉用户。
-  if (!allowMany) {
-    const total = episodes.length || covered.size;
-    const span1 = (value) => String(value || '').split(/[、,，]/).filter(Boolean).length === 1 && !/[–\-~至]/.test(String(value || ''));
-    const solo = chars.filter((c) => c.kind !== 'group' && span1(c.episodes));
-    const roleCap = lookTableRoleCap(total);
-    if (chars.length > roleCap) {
-      const weakest = solo.slice().sort((a, b) => (a.lines || 0) - (b.lines || 0)).slice(0, 16).map((c) => `${c.name}(${c.lines || 0}句)`);
-      issues.push(`角色 ${chars.length} 个，超过上限 ${roleCap} 个（约每集 1.2 个，至少 30）；其中 ${solo.length} 个只出现一集。`
-        + `同一场里同一类的龙套并成一个群体角色（小区邻居数人、武考考生若干、测试场学员数人——人物行、【形象】行、台词的说话人都改成这个群体名），一组一张卡；`
-        + `有名字、跨集出现、戏份重的才单独建。台词最少的几个：${weakest.join('、')}`);
-    }
-    const carded = props.filter((p) => p.card === true);
-    const propCap = lookTablePropCap(total);
-    if (carded.length > propCap) {
-      const fewest = carded.slice().sort((a, b) => String(a.episodes || '').length - String(b.episodes || '').length).slice(0, 16).map((p) => p.name);
-      issues.push(`建卡道具 ${carded.length} 件，超过上限 ${propCap} 件（约每 2 集 1 件，至少 12；建议值是每 4 集 1 件）。`
-        + `只给「跨集反复出现、外观必须前后一致」的建卡，只出现一两集的单据、杯盘、手机改成 card:false。出现最少的几件：${fewest.join('、')}`);
-    }
+  // 该不该单独建卡，按「是什么」判断，不设数量上限（群像戏、道具戏真有那么多就是那么多）。
+  // 2026-10-04 一部 68 集的表：188 个角色里 40 个一句台词都没有的背景人物、39 个只差「甲乙丙」编号的同类龙套；
+  // 72 件建卡道具里 45 件只出现一集（力量测试器/测试机/测试柱/测试仪 各一张卡）。问题在识别规则，不在数量。
+  // keep = { 名字: 保留原因 }：确实要单独建的，写明原因就不再提。
+  const span1 = (value) => String(value || '').split(/[、,，]/).filter(Boolean).length === 1 && !/[–\-~至]/.test(String(value || ''));
+  const kept = (name) => String(keep?.[name] || '').trim().length >= 4;
+  // ① 没有台词、只出现一集的背景人物不是角色
+  const background = chars.filter((c) => c.kind === 'human' && span1(c.episodes) && Number(c.lines || 0) === 0 && typeof c.lines === 'number' && !kept(c.name));
+  if (background.length) {
+    issues.push(`${background.length} 个只出现一集、一句台词都没有的背景人物被单独建成了角色：${background.slice(0, 14).map((c) => c.name).join('、')}${background.length > 14 ? ' 等' : ''}。`
+      + `背景里的人不用建角色——写进动作描述（△）就行；同一类的一群人写成一个群体角色（逃难人群、监控室工作人员数人）。`
+      + `确实要固定长相的（没台词但有重头戏的杀手、尸体、照片上的人），在「保留说明.json」里写上 名字: 原因。`);
+  }
+  // ② 只差「甲乙丙／数字」编号的同类龙套并成一个群体
+  const stem = (name) => String(name || '').replace(/[甲乙丙丁戊己庚辛ABCDEFG一二三四五六七八九十\d]+$/, '');
+  const families = new Map();
+  for (const c of chars) {
+    if (c.kind !== 'human' || !span1(c.episodes) || Number(c.lines || 0) > 2 || kept(c.name)) continue;
+    const key = stem(c.name);
+    if (!key || key === c.name) continue;
+    if (!families.has(key)) families.set(key, []);
+    families.get(key).push(c.name);
+  }
+  const numbered = [...families.entries()].filter(([, names]) => names.length >= 2);
+  if (numbered.length) {
+    issues.push(`${numbered.length} 组同类龙套一人一个角色（只差甲乙丙编号、各一两句台词）：${numbered.slice(0, 8).map(([key, names]) => `${key}×${names.length}`).join('、')}${numbered.length > 8 ? ' 等' : ''}。`
+      + `并成一个群体角色（${numbered[0][0]}数人）：「人物：」行、【形象】行、台词的说话人都改成群体名，一组一张卡。其中谁有名字、后面还会出现，就给他起名单独建。`);
+  }
+  // ③ 同一件东西只能有一个名字、一张卡：建卡原因里自己写了「和另一件是同一实体／沿用它的外观」的
+  const carded = props.filter((p) => p.card === true && !kept(p.name));
+  const sameThing = carded.filter((p) => SAME_ENTITY_RE.test(String(p.reason || '')));
+  if (sameThing.length) {
+    issues.push(`${sameThing.length} 件建卡道具的原因里写着它和另一件是同一样东西，却各建了一张卡：${sameThing.slice(0, 10).map((p) => p.name).join('、')}${sameThing.length > 10 ? ' 等' : ''}。`
+      + `同一件东西在剧本里统一成一个名字（各集的道具行、动作描述一起改），只建一张卡；两张卡画出来不会是同一个样子。`);
+  }
+  // ④ 同一类东西按「谁的／哪一集的」拆成了好几张卡（江莉雪手机、记者手机、学员手机；采访话筒、新闻话筒、发布会话筒）
+  const bySuffix = new Map();
+  for (const p of carded) {
+    const name = String(p.name || '');
+    if (name.length < 2) continue;
+    const key = name.slice(-2);
+    if (!bySuffix.has(key)) bySuffix.set(key, []);
+    bySuffix.get(key).push(name);
+  }
+  const sameKind = [...bySuffix.values()].filter((names) => names.length >= 2);
+  if (sameKind.length) {
+    issues.push(`${sameKind.length} 类东西各拆成了好几张卡：${sameKind.slice(0, 8).map((names) => names.join('／')).join('；')}${sameKind.length > 8 ? ' 等' : ''}。逐类判断：`
+      + `是同一件东西 → 统一成一个名字、一张卡；`
+      + `是不同的人各自拿的普通物件（手机、话筒、出租车、电脑）→ 不建卡（card:false），客户端按文字描述就能画，观众也不会认它长什么样；`
+      + `确实是外观不同、都要前后一致的两件东西 → 在「保留说明.json」里写 名字: 两件外观上差在哪。`);
   }
   return issues;
 }
-export const lookTableRoleCap = (episodeCount) => Math.max(30, Math.ceil(Number(episodeCount || 0) * 1.2));
-export const lookTablePropCap = (episodeCount) => Math.max(12, Math.ceil(Number(episodeCount || 0) / 2));
 
 // 形象表体检：没写外观的形象、非主形象没写原因
 export function lookTableIssues(table) {
