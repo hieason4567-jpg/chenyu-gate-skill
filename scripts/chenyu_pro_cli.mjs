@@ -15,9 +15,14 @@ import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, norma
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates } from './variant_candidates.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.17.0 2026-10-04  形象变体不再靠 Agent 凭记忆：assets-apply 在人物/场景/道具合并通过后，按平台的 character_variants.json 列出
+//                    「形象变体候选」（每个角色主造型以外的造型，带强信号标记），Agent 逐条表态 build/skip，全部表态才给 ASSETS_PASS；
+//                    variants --source 对照判定查剧本漏用（VARIANTS_PASS / VARIANTS_FLAGGED）。起因：72 集一稿 31 个角色全是单形象，
+//                    第 20 集病号服+包扎仍绑着「孕妇」，所有检查都通过。
 // v2.16.0 2026-10-04  ① 资产图：新命令 asset-image（按形象表列出可出图条目 → 用户点选 → 报价 → 平台出横版 16:9 资产图，约 6 分/张；
 //                    图下载到 资产图/ 并把位置写回形象表的 image 字段）。全部剧本和形象表完成后才问用户要不要出、出谁的。
 //                    ② 道具分级：形象表道具按 A 建卡 / B 剧情 / C 普通 分级，B、C 默认不建卡，建卡数量约每 4 集 1 件（超了提醒、不拦）。
@@ -159,7 +164,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.16.0';
+const VERSION = '2.17.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -797,6 +802,7 @@ async function cmdVariants() {
   fs.writeFileSync(out, markdown, 'utf8');
   for (const [name, variants] of byRole) console.log(`  ${name}：${variants.size} 个形象（${[...variants.keys()].join(' / ')}）`);
   console.log(`✓ 已汇总 ${byRole.size} 个角色的形象变体 -> ${out}`);
+  checkVariantsAgainstSource(d, arg('source', ''), ctx.usage);
 }
 
 async function cmdGate() {
@@ -1722,12 +1728,97 @@ function cmdAssetsApply() {
   fs.writeFileSync(path.join(outDir, '资产合并表.md'), result.mapMarkdown, 'utf8');
   const s = result.stats;
   for (const w of [...checked.warnings, ...result.warnings]) console.log('  ⚠ ' + w);
+  // 形象变体：分析结果一回来就定（和人物合并是同一步）。候选来自平台的 character_variants.json，每条都要表态，没表态完不给 PASS。
+  const variantState = prepareVariantDecisions(dir, map);
+  if (variantState.pending.length) {
+    console.log(`ASSETS_VARIANTS_PENDING  人物/场景/道具已合并（整理版已写出 -> ${outDir}），但形象变体还有 ${variantState.pending.length}/${variantState.total} 条没定：`);
+    for (const line of variantState.pending.slice(0, 30)) console.log('  ✗ ' + line);
+    if (variantState.pending.length > 30) console.log(`  … 另有 ${variantState.pending.length - 30} 条`);
+    console.log(`  先读 ${variantState.candidateFile}（平台记下的每个角色主造型以外的造型：哪几集、什么样、因何而变），\n  再逐条填 ${variantState.decisionFile}：decision=build（写 variant 变体名，身份/事件命名）或 skip（写 reason）。\n  强信号（住院、受伤包扎、怀孕、婚礼、伪装、年龄段不同…）默认要建。填完重跑本命令，直到 ASSETS_PASS。`);
+    process.exit(2);
+  }
+  if (variantState.total) console.log(`  形象变体 ${variantState.total} 条候选已全部表态：建 ${variantState.built} 个、不建 ${variantState.skipped} 个 -> ${variantState.tableFile}`);
   console.log(`ASSETS_PASS  整理版已写出 -> ${outDir}（零积分，未联网；原分析稿没有改动）`);
   console.log(`  说话人 ${s.speakers_before} 种 -> ${s.speakers_after} 种（换名 ${s.speakers_changed} 行，其中逐句指定 ${s.line_overrides} 行）`);
   console.log(`  正式人物 ${s.characters} 个；场景 ${s.scene_writings} 种写法 -> ${s.scenes} 个；关键道具 ${s.key_props} 件；待核编号 ${s.unresolved_labels} 个；残留未处理编号 ${s.residual_observation_ids}`);
   console.log(`  台词列、字幕列、镜头列逐行核对一致（${s.rows} 行）`);
   console.log('  下一步：写作和洗稿都读 整理版/video_reverse_全剧合集.md；资产合并表.md 随稿交付。');
+  if (variantState.built) console.log('  写每场【形象】时照 整理版/形象变体判定表.md：判定要建的变体，在它出现的那几集写 角色=变体名（原因）。写完跑 chenyu-pro variants --dir <剧本目录> --source <分析稿目录>，到 VARIANTS_PASS。');
   console.log(`  先存档（零积分，把合并结果留在平台项目里，换机器/换 Agent 接着做时能取回）：\n    chenyu-pro archive --project <项目id片段或剧名> --dir "${dir}"`);
+}
+
+// 形象变体候选与判定（assets-apply 调用）。没有 character_variants.json（旧项目/平台没出）时不拦。
+function prepareVariantDecisions(dir, map) {
+  const state = { total: 0, built: 0, skipped: 0, pending: [], candidateFile: '', decisionFile: '', tableFile: '', candidates: [], decisions: [] };
+  const source = path.join(dir, 'character_variants.json');
+  if (!fs.existsSync(source)) return state;
+  let variantsJson;
+  try { variantsJson = JSON.parse(fs.readFileSync(source, 'utf8').replace(/^﻿/, '')); } catch { return state; }
+  const labels = Object.fromEntries([...(map.labels || new Map()).entries()].map(([key, value]) => [key, value?.to || '']));
+  const candidates = buildCandidates(variantsJson, nameResolver({ assetMap: { characters: map.characters, labels } }));
+  state.candidates = candidates;
+  state.total = candidates.length;
+  if (!candidates.length) return state;
+  const workDir = path.join(dir, ASSET_DIR);
+  fs.mkdirSync(workDir, { recursive: true });
+  state.candidateFile = path.join(workDir, VARIANT_CANDIDATE_FILE);
+  state.decisionFile = path.join(workDir, VARIANT_DECISION_FILE);
+  let existing = [];
+  if (fs.existsSync(state.decisionFile)) { try { existing = JSON.parse(fs.readFileSync(state.decisionFile, 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${state.decisionFile} 不是合法 JSON：${e.message}`); } }
+  const decisions = decisionTemplate(candidates, existing);
+  state.decisions = decisions;
+  fs.writeFileSync(state.candidateFile, renderCandidates(candidates), 'utf8');
+  fs.writeFileSync(state.decisionFile, JSON.stringify(decisions, null, 1), 'utf8');
+  for (const d of decisions) {
+    const c = candidates.find((item) => item.id === d.id);
+    const where = `${d.id}「${d.look}」第 ${d.episodes} 集${c.signals.length ? '（强信号：' + c.signals.join('、') + '）' : ''}`;
+    if (!['build', 'skip'].includes(d.decision)) state.pending.push(`${where} 还没表态`);
+    else if (d.decision === 'build' && !String(d.variant || '').trim()) state.pending.push(`${where} 填了 build 但没写 variant（变体名）`);
+    else if (d.decision === 'skip' && !String(d.reason || '').trim()) state.pending.push(`${where} 填了 skip 但没写 reason`);
+    else if (d.decision === 'skip' && c.signals.length && String(d.reason).trim().length < 8) state.pending.push(`${where} 强信号造型不建变体，reason 要写清楚为什么观众不需要认出这个变化`);
+    else if (d.decision === 'build') state.built += 1;
+    else state.skipped += 1;
+  }
+  if (!state.pending.length) {
+    const outDir = path.join(dir, '整理版');
+    fs.mkdirSync(outDir, { recursive: true });
+    state.tableFile = path.join(outDir, '形象变体判定表.md');
+    const rows = ['# 形象变体判定表（写【形象】行时照这张表）', '', '| 角色 | 变体名 | 出现集 | 平台记录的造型 | 因何而变 | 判定 |', '| --- | --- | --- | --- | --- | --- |'];
+    const cell = (value) => String(value || '').replace(/\|/g, '／').replace(/\s+/g, ' ').trim() || '-';
+    for (const d of decisions) {
+      const c = candidates.find((item) => item.id === d.id);
+      rows.push(`| ${cell(d.role)} | ${d.decision === 'build' ? cell(d.variant) : '（并入主形象）'} | ${cell(d.episodes)} | ${cell(c.look)}：${cell(c.description)} | ${cell(c.cause)} | ${d.decision === 'build' ? '建变体' : '不建：' + cell(d.reason)} |`);
+    }
+    fs.writeFileSync(state.tableFile, rows.join('\n') + '\n', 'utf8');
+  }
+  return state;
+}
+
+// variants --source：对照资产整理时定下的形象变体判定，查「说了要建、剧本却没用上」的
+function checkVariantsAgainstSource(scriptDir, sourceArg, usage) {
+  if (!sourceArg) { console.log('  （加 --source <分析稿目录> 可对照平台记录的造型，查有没有漏建的变体）'); return; }
+  const src = path.resolve(sourceArg);
+  const variantsFile = path.join(src, 'character_variants.json');
+  const mapFile = path.join(src, ASSET_DIR, ASSET_MAP_FILE);
+  const decisionFile = path.join(src, ASSET_DIR, VARIANT_DECISION_FILE);
+  if (!fs.existsSync(variantsFile)) { console.log('  · 分析稿目录里没有 character_variants.json，跳过变体漏建检查'); return; }
+  if (!fs.existsSync(mapFile) || !fs.existsSync(decisionFile)) die(`还没做形象变体判定：先 chenyu-pro assets-apply --dir "${src}" 到 ASSETS_PASS`);
+  const readJson = (file) => JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, ''));
+  const assetMap = normalizeAssetMap(readJson(mapFile));
+  const labels = Object.fromEntries([...(assetMap.labels || new Map()).entries()].map(([key, value]) => [key, value?.to || '']));
+  // 洗稿换过名：判定表里是原名，剧本里是新名，按洗稿映射对上
+  const renameFile = arg('map', '') ? path.resolve(arg('map')) : [path.join(scriptDir, '洗稿映射.json'), path.join(path.dirname(scriptDir), '洗稿映射.json')].find((file) => fs.existsSync(file));
+  const renames = renameFile && fs.existsSync(renameFile) ? (readJson(renameFile).renames || {}) : {};
+  const baseCandidates = buildCandidates(readJson(variantsFile), nameResolver({ assetMap: { characters: assetMap.characters, labels } }));
+  const scriptCandidates = baseCandidates.map((c) => ({ ...c, role: renames[c.role] || c.role }));
+  const report = checkAgainstScript(scriptCandidates, readJson(decisionFile), usage);
+  if (!report.total) { console.log('  · 平台没有记录到主造型以外的造型，无需核对'); return; }
+  if (!report.flags.length) { console.log(`VARIANTS_PASS  ${report.total} 条造型候选：建 ${report.built} 个都已在剧本对应集用上，不建 ${report.skipped} 个都有原因`); return; }
+  console.log(`VARIANTS_FLAGGED  ${report.flags.length} 处要返工（建 ${report.built} / 不建 ${report.skipped} / 共 ${report.total}）：`);
+  for (const line of report.flags.slice(0, 40)) console.log('  ✗ ' + line);
+  if (report.flags.length > 40) console.log(`  … 另有 ${report.flags.length - 40} 处`);
+  console.log('  按上面逐条改剧本的【形象】行（并在场内补可见的换装 △），或回到 资产整理/形象变体判定.json 改判定后重跑 assets-apply，再跑本命令直到 VARIANTS_PASS。');
+  process.exitCode = 2;
 }
 
 // 存档：把 Agent 本地做出来的东西回传到平台项目里留档（零积分）。只做记录，不改平台的原始分析稿、不改项目状态。
@@ -2813,6 +2904,7 @@ function cmdHelp() {
   chenyu-pro save --project <id片段> --episode 1 --file 第001集.txt  回传 Agent 写好的一集正文
   chenyu-pro save --project <id片段> --dir <目录>          批量回传(文件名含 第N集 的 .txt/.md)
   chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词/形象标记)，改到 GATE_PASS
+  chenyu-pro variants --dir <剧本目录> --source <分析稿目录>            对照资产整理时定的形象变体，查剧本有没有漏用(到 VARIANTS_PASS)
   chenyu-pro variants --dir <目录> [--out 文件]           从正文【形象】标记汇总形象变体表（每人几个变体、出现在哪几集哪几场）
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
   chenyu-pro fetch --project <id片段> --out <目录>          导出交付正文到本地
