@@ -20,6 +20,7 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.24.1 2026-10-04  SKILL.md 触发说明：用户一句话提到「辰屿 / 辰屿技能 / 用辰屿改编、反推、洗稿」就用本 Skill，命令由 Agent 敲。CLI 无功能变化。
 // v2.24.0 2026-10-04  不完整的形象表交不出去：assets-export 做完整性检查（角色外观、形象名、每集有形象、场景有描述、道具非空且已判定并有描述），
 //                    完整才生成「形象表.json」（LOOK_TABLE_PASS），不完整只写「形象表.未完成.json」并列出缺项；deliver 不收不完整的表。
 //                    起因：一张道具清单为空、形象名全是服装名的表被导进客户端，客户端道具 0 件。
@@ -188,7 +189,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.24.0';
+const VERSION = '2.24.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
