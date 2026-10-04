@@ -18,6 +18,9 @@ import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.14.6 2026-10-04  提交后盯到结束：新命令 video-wait（等分析跑完并自动取回，每次最多等 8 分钟，没跑完退出码 3 再跑一次）；
+//                    video-analyze 提交成功后先说明「被中断怎么接着等、别重新提交」，新增 --no-wait；SKILL.md 要求提交后建定时任务
+//                    跑 video-wait、拿到结果后取消定时任务并直接进入资产整理。
 // v2.14.5 2026-10-04  取回分析稿后明确告诉 Agent「完不完整、下一步谁做什么」：video-fetch / video-analyze 结尾统一打印完整性结论
 //                    （共几集、缺哪几集、哪几集没内容）；平台状态 needs_review 且没有失败集 = 分析完整、只是人物还没归属，
 //                    下一步是 Agent 自己做资产整理（零积分），不是重新分析。SKILL.md 同步写明这一步由 Agent 做。
@@ -149,7 +152,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.14.5';
+const VERSION = '2.14.6';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1223,6 +1226,43 @@ async function cmdVideoFetch() {
   if (!ok) process.exitCode = 2;
 }
 
+// 零积分：等项目的视频分析跑完，跑完自动取回分析稿并给出完整性结论。提交后命令被中断、或想分次查进度时用。
+// 每次最多等 --timeout-min 分钟（默认 8，适配会掐长命令的 Agent 环境）；没跑完退出码 3，再跑一次即可。
+async function cmdVideoWait() {
+  const fragment = arg('project') || die('缺 --project <id片段或剧名>');
+  const target = await findProject(fragment);
+  if (target.mode && target.mode !== 'video_reverse') die(`项目《${target.title}》不是视频分析项目`);
+  const outDir = path.resolve(arg('out', './chenyu-video-analysis'));
+  const deadline = Date.now() + Math.max(0.2, Number(arg('timeout-min', '8')) || 8) * 60000;
+  const again = `chenyu-pro video-wait --project ${target.id.slice(-8)} --out "${outDir}"`;
+  let lastMsg = '';
+  for (;;) {
+    let jobs = null;
+    try { jobs = (await api(`/api/projects/${target.id}/jobs`)).jobs || []; } catch (e) { if (!e?.netFailed) throw e; console.log(`  … 进度查询网络暂不通(${e.detail})，平台仍在后台分析`); }
+    if (jobs) {
+      const job = jobs.find((j) => /video_reverse/.test(String(j.job_type || j.type || '')));
+      if (!job) die(`项目《${target.title}》还没有提交过视频分析`);
+      const st = String(job.status || '');
+      const msg = `${st} ${job.progress != null ? job.progress + '%' : ''} ${String(job.message || '').replace(/\s+/g, ' ').slice(0, 120)}`.trim();
+      if (msg !== lastMsg) { console.log('  … ' + msg); lastMsg = msg; }
+      if (['failed', 'cancelled', 'error'].includes(st)) die(`分析失败: ${job.message || st}\n  （定时任务可以取消了）把这条原样告诉用户，不要整批重新提交。`);
+      if (!['queued', 'running', 'pending', 'processing'].includes(st)) break;
+    }
+    if (Date.now() >= deadline) {
+      console.log(`⏳ 还在跑（${lastMsg || '排队中'}）。不是卡住，也不要重新提交。\n  隔 2~3 分钟再跑一次同一条命令（或让定时任务继续跑）：\n    ${again}`);
+      process.exitCode = 3;
+      return;
+    }
+    await sleep(15000);
+  }
+  const { got, badSegments } = await downloadVideoAnalysis(target.id, outDir);
+  if (!got) die(`分析已结束但没取到分析稿，稍后再跑：${again}`);
+  console.log(`✓ 分析已结束，已取回《${target.title}》分析稿 ${got} 个文件 -> ${outDir}（零积分）`);
+  console.log('  （如果为这个项目建了定时任务/轮询，现在取消掉。）');
+  const ok = printAnalysisVerdict({ outDir, pid: target.id, jobState: await latestAnalysisJobState(target.id), badSegments });
+  if (!ok) process.exitCode = 2;
+}
+
 // 重建人物身份和资产表：用平台上已保存的逐段分析结果重新审计人物、重新整理资产，不重看视频、不扣视频分。
 // 整理规则更新后、或者资产表合并错了，用这个重出，不要重新提交视频。只有文本步骤按次计费。
 async function cmdVideoRebuild() {
@@ -1525,6 +1565,11 @@ async function cmdVideoAnalyze() {
   const dialogueTimeline = String(process.env.CHENYU_DIALOGUE_TIMELINE || '').trim().toLowerCase();
   await api(`/api/projects/${pid}/video-reverse/start`, { method: 'POST', body: { videos, asset_consolidation: consolidation, ...(dialogueTimeline ? { dialogue_timeline: dialogueTimeline } : {}), ...(note ? { prompt: note } : {}) } });
   console.log(`✓ 已提交分析 ${videos.length} 个视频（仅分析，不代写）`);
+  // 提交成功后平台在后台跑，和本命令是否还活着无关。很多 Agent 环境会在几分钟后掐掉长命令——把接着等的办法先说清楚。
+  console.log(`ℹ 分析在平台后台进行（大任务可能几十分钟）。本命令会一直等到结束并自动取回；如果它被你的环境中断/超时：\n` +
+    `   不要重新提交（会重复扣分）。接着等：chenyu-pro video-wait --project ${pid.slice(-8)} --out "${path.resolve(arg('out', './chenyu-video-analysis'))}"\n` +
+    `   video-wait 每次最多等几分钟，没结束会返回「还在跑」——那就隔 2~3 分钟再跑一次，或建一个定时任务去跑，直到它打印「分析稿完整性」；拿到结果后把定时任务取消。`);
+  if (flag('no-wait')) return;
 
   // ⑤ 轮询到分析结束
   const deadline = Date.now() + Number(arg('timeout-min', '90')) * 60000;
@@ -2557,6 +2602,7 @@ function cmdHelp() {
   chenyu-pro video-analyze --video-file a.mp4,b.mp4 [--yes]  视频→分析稿(只分析不代写)
   chenyu-pro video-analyze --video-url <链接> [--out <目录>]  计费: ${POINTS_PER_SEGMENT} 分 / ${SEGMENT_SECONDS} 秒段(不足一段按一段)
   chenyu-pro video-analyze --project <id片段|剧名> --video-file 第4集.mp4  同一部剧追加到已有项目(人物跨集合并)
+  chenyu-pro video-wait --project <id片段|剧名> [--out <目录>] [--timeout-min 8]  等分析跑完并自动取回(没跑完退出码3,再跑一次)
   chenyu-pro video-fetch --project <id片段|剧名> [--out <目录>]  零积分重新取回最新分析稿(平台修复后用这个取)
   chenyu-pro video-rebuild --project <id片段|剧名> [--out <目录>] [--yes]  不重看视频，重建人物身份(和资产表)，只扣文本步骤分
     同一部剧只用一个项目：一次提交全部集，或后续用 --project 追加；不要一集一个项目、不要并发提交。
@@ -2586,7 +2632,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
