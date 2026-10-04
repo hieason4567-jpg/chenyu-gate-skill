@@ -20,6 +20,8 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.22.0 2026-10-04  变体出图沿用主形象的脸：asset-image 出非主形象时把主形象的图作参考（图生图），提示词照客户端「主状态身份母版」的写法；
+//                    主形象没出过图、这次也没选的变体不出，提示把主形象一起选上。
 // v2.21.1 2026-10-04  deliver 把 资产图/ 放在形象表旁边（之前放进了 资产/资产图，形象表里记的相对路径就对不上了）。
 // v2.21.0 2026-10-04  变体规则跟上客户端这边新定的三条：① 活动必须穿的功能性着装（滑雪服/泳装/潜水服/赛车服/练功服…）是强信号，本人正在做这项活动时必须建变体，
 //                    离开后换回；② 原文明确写了换衣服的必须建，不当日常换装跳过；③ 角色名不能和地点/柜台/物件同名（前台、礼宾台），资产整理时必须改成指人的名字。
@@ -180,7 +182,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.21.1';
+const VERSION = '2.22.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2236,7 +2238,8 @@ function assetImageCandidates(table) {
   for (const c of table.characters || []) for (const l of c.looks || []) {
     const prompt = String(l.styling?.description || l.design?.prompt || l.appearance || '').trim();
     if (!prompt) continue;
-    items.push({ type: 'look', name: `${c.name}-${l.variant}`, owner: c.name, variant: l.variant, main: l.main === true, prompt, ref: l, episodes: l.episodes || c.episodes || '' });
+    const mainLook = (c.looks || []).find((x) => x.main === true) || (c.looks || [])[0];
+    items.push({ type: 'look', name: `${c.name}-${l.variant}`, owner: c.name, variant: l.variant, main: l === mainLook, mainRef: mainLook, prompt, ref: l, episodes: l.episodes || c.episodes || '' });
   }
   for (const p of table.places || []) if (String(p.description || '').trim()) items.push({ type: 'place', name: p.name, prompt: String(p.description).trim(), ref: p, episodes: p.episodes || '' });
   for (const p of table.props || []) if (p.card === true && String(p.description || '').trim()) items.push({ type: 'prop', name: p.name, prompt: String(p.description).trim(), ref: p, episodes: p.episodes || '' });
@@ -2258,7 +2261,7 @@ async function cmdAssetImage() {
       const group = items.filter((item) => item.type === type);
       if (!group.length) continue;
       console.log(`\n【${ASSET_IMAGE_KIND[type]}】${group.length} 个`);
-      for (const item of group) console.log(`  ${String(item.no).padStart(3)}. ${item.ref.image?.file ? '✓ ' : '  '}${item.name}${item.main ? '（主形象）' : ''}${item.episodes ? '  出现集 ' + item.episodes : ''}`);
+      for (const item of group) console.log(`  ${String(item.no).padStart(3)}. ${item.ref.image?.file ? '✓ ' : '  '}${item.name}${item.main ? '（主形象）' : item.type === 'look' ? `（变体，沿用主形象的脸${item.mainRef?.image?.artifact_id ? '' : '——要先出主形象'}）` : ''}${item.episodes ? '  出现集 ' + item.episodes : ''}`);
     }
     console.log('\n把这张清单给用户看，问：要不要出资产图、出哪些（可以只出主角主形象）。用户选好后：');
     console.log(`  chenyu-pro asset-image --project <项目> --look-table "${file}" --pick 1,3,7        先报价`);
@@ -2275,6 +2278,14 @@ async function cmdAssetImage() {
     for (const item of found) if (!picked.includes(item)) picked.push(item);
   }
   const redo = flag('force');
+  // 变体（非主形象）用主形象的图当参考图生图，保证同一张脸——和客户端一致。所以主形象要先出：同一批里主形象排前面；
+  // 主形象既没出过图、这次也没选的变体，不出（各出各的会换脸，出了也不能用）。
+  picked.sort((a, b) => (a.type === 'look' && b.type === 'look' ? (b.main ? 1 : 0) - (a.main ? 1 : 0) : 0));
+  const mainMissing = picked.filter((item) => item.type === 'look' && !item.main && !item.mainRef?.image?.artifact_id && !picked.some((other) => other.type === 'look' && other.main && other.owner === item.owner));
+  if (mainMissing.length) {
+    const need = [...new Set(mainMissing.map((item) => items.find((other) => other.type === 'look' && other.main && other.owner === item.owner)).filter(Boolean))];
+    die(`这几个是变体形象，要用主形象的图保证同一张脸，但主形象还没出图：${mainMissing.map((item) => item.name).join('、')}\n  把主形象一起选上再跑（告诉用户会多出 ${need.length} 张）：--pick ${[...need.map((item) => item.no), ...picked.map((item) => item.no)].join(',')}`);
+  }
   const todo = picked.filter((item) => redo || !item.ref.image?.file);
   const skipped = picked.length - todo.length;
   console.log(`已选 ${picked.length} 个${skipped ? `（其中 ${skipped} 个已出过图，跳过；要重出加 --force）` : ''}：${todo.map((item) => item.name).join('、') || '无'}`);
@@ -2292,11 +2303,17 @@ async function cmdAssetImage() {
   for (const item of todo) {
     process.stdout.write(`  … ${ASSET_IMAGE_KIND[item.type]}「${item.name}」出图中`);
     try {
+      // 变体要用主形象的图；主形象这一批里没出成就不出这张（不花分、不换脸）
+      if (item.type === 'look' && !item.main && !item.mainRef?.image?.artifact_id) throw new Error('主形象这次没出成，这个变体先不出（各出各的会换脸）');
       const res = await api(`/api/projects/${p.id}/assets/generate-image`, {
         method: 'POST', timeoutMs: 360000, retries: 0, softFail: true,
         body: {
           kind: ASSET_IMAGE_KIND[item.type], name: item.name, prompt: item.prompt, aspect_ratio: '16:9', force: redo,
           ...(item.type === 'look' ? { base_character_name: item.owner, state_name: item.variant } : {}),
+          // 变体：主形象的图作参考（图生图），提示词按客户端「沿用主状态身份母版」的写法
+          ...(item.type === 'look' && !item.main && item.mainRef?.image?.artifact_id
+            ? { reference_artifact_ids: [item.mainRef.image.artifact_id], identity_reference: true, primary_description: String(item.mainRef.styling?.description || item.mainRef.design?.prompt || item.mainRef.appearance || '') }
+            : {}),
           ...(arg('style', '') ? { visual_style: arg('style') } : {}),
           prompt_template: 'client', // 和客户端资产卡同一套出图提示词（版式在知识库里）
           save_scope: 'project', source_text: ''
@@ -2313,6 +2330,7 @@ async function cmdAssetImage() {
       const fileName = `${ASSET_IMAGE_KIND[item.type]}_${item.name.replace(/[\\/:*?"<>|\s]+/g, '_')}.${ext}`;
       fs.writeFileSync(path.join(outDir, fileName), buffer);
       item.ref.image = {
+        ...(item.type === 'look' && !item.main ? { identity_from: item.mainRef.image.artifact_id } : {}),
         file: `${ASSET_IMAGE_DIR}/${fileName}`, project_id: p.id, artifact_id: artifact.id,
         sha256: crypto.createHash('sha256').update(buffer).digest('hex'), bytes: buffer.length, ratio: '16:9', generated_at: new Date().toISOString()
       };
