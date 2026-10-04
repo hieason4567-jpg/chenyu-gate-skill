@@ -20,6 +20,8 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.19.0 2026-10-04  复核可以多代理并行：review-split 把待处理的称谓角色和形象变体按集数分包，每包自带相关镜头行原文和结论格式，
+//                    子代理各做一包只写结论；review-merge 统一落地（并人/改名写进合并表，独立/变体写进判定表），拿不准的留给主 Agent。
 // v2.18.0 2026-10-04  人物合并复核：ASSETS_PASS 以前只查表填全了没有。现在合并后还剩下的称谓/职业/镜头描述式角色里戏份不小的
 //                    （3 句台词以上或跨 2 集以上），逐个要 Agent 确认——是某个具名角色就并掉、剧里有名字就改名、确实独立就写依据；
 //                    没处理完输出 ASSETS_REVIEW_PENDING。起因：68 集一稿通过后还剩 128 个职业/镜头标签，一人多标签被用户指出才合并。
@@ -170,7 +172,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.18.0';
+const VERSION = '2.19.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -1740,7 +1742,7 @@ function cmdAssetsApply() {
     console.log(`ASSETS_REVIEW_PENDING  表已填全（整理版已写出 -> ${outDir}），但还有 ${roleReview.pending.length}/${roleReview.total} 个称谓角色没复核——同一个人常被记成不同称呼，合并通过不等于合对了：`);
     for (const line of roleReview.pending.slice(0, 30)) console.log('  ✗ ' + line);
     if (roleReview.pending.length > 30) console.log(`  … 另有 ${roleReview.pending.length - 30} 个`);
-    console.log(`  先读 ${roleReview.reviewFile}（每个角色的出现集、台词样例、同集出场的具名角色），逐个判断：\n   · 是某个具名角色 → 回 资产合并表.json 并掉；剧里有名字 → 改成真名。重跑本命令后它会自动消失。\n   · 确实是没名字的独立角色 → 在 ${roleReview.decisionFile} 里填 decision=independent + reason。\n  全部处理完重跑本命令，直到 ASSETS_PASS。`);
+    console.log(`  先读 ${roleReview.reviewFile}（每个角色的出现集、台词样例、同集出场的具名角色），逐个判断：\n   · 是某个具名角色 → 回 资产合并表.json 并掉；剧里有名字 → 改成真名。重跑本命令后它会自动消失。\n   · 确实是没名字的独立角色 → 在 ${roleReview.decisionFile} 里填 decision=independent + reason。\n  全部处理完重跑本命令，直到 ASSETS_PASS。\n  条目多、想快：chenyu-pro review-split --dir "${dir}" 分包后让子代理并行做，再 review-merge。`);
     process.exit(2);
   }
   if (roleReview.total) console.log(`  称谓角色复核 ${roleReview.total} 个已全部确认为独立角色（有依据）`);
@@ -1874,6 +1876,181 @@ function checkVariantsAgainstSource(scriptDir, sourceArg, usage) {
   if (report.flags.length > 40) console.log(`  … 另有 ${report.flags.length - 40} 处`);
   console.log('  按上面逐条改剧本的【形象】行（并在场内补可见的换装 △），或回到 资产整理/形象变体判定.json 改判定后重跑 assets-apply，再跑本命令直到 VARIANTS_PASS。');
   process.exitCode = 2;
+}
+
+// ---------- 复核分包：让多个子代理并行做「称谓角色复核」和「形象变体判定」 ----------
+// 准确的复核要回到逐集分析表里看上下文，一个 Agent 串行做很慢。这里把待处理的条目按集数切成几包，
+// 每包自带证据（相关镜头行的原文），子代理只读自己那一包、只写一份结论；主 Agent 用 review-merge 合并。
+// 子代理不直接改合并表——两个子代理各改各的会互相覆盖；合并/改名由 review-merge 统一落到合并表。
+const REVIEW_PACK_DIR = '复核分包';
+
+function loadReviewContext(dir) {
+  const mapFile = path.join(dir, ASSET_DIR, ASSET_MAP_FILE);
+  const mergedFile = path.join(dir, '整理版', DOSSIER_FILE);
+  if (!fs.existsSync(mapFile) || !fs.existsSync(mergedFile)) die(`还没到复核这一步：先 chenyu-pro assets-apply --dir "${dir}"，出现 ASSETS_REVIEW_PENDING 或 ASSETS_VARIANTS_PENDING 后再分包`);
+  const map = normalizeAssetMap(JSON.parse(fs.readFileSync(mapFile, 'utf8').replace(/^﻿/, '')));
+  const mergedText = fs.readFileSync(mergedFile, 'utf8');
+  const dossier = parseDossier(mergedText);
+  const labels = [...collectAssetEvidence(dossier).labels.values()];
+  const readDecisions = (name) => { const file = path.join(dir, ASSET_DIR, name); try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')) : []; } catch { return []; } };
+  const roleDone = new Set(readDecisions(ROLE_DECISION_FILE).filter((d) => d?.decision === 'independent' && String(d.reason || '').trim().length >= 8).map((d) => d.id));
+  const variantDone = new Set(readDecisions(VARIANT_DECISION_FILE).filter((d) => (d?.decision === 'build' && String(d.variant || '').trim()) || (d?.decision === 'skip' && String(d.reason || '').trim())).map((d) => d.id));
+  const roles = rolesNeedingReview(labels).filter((item) => !roleDone.has(item.id));
+  const variants = collectVariantCandidates(dir, map).filter((item) => !variantDone.has(item.id));
+  return { mapFile, map, dossier, labels, roles, variants };
+}
+
+// 某个角色在指定几集里的相关镜头行（他说话的、动作或外观里提到他的），各带前后一行上下文
+function evidenceRows(dossier, name, episodes, cap = 36) {
+  const wanted = new Set(episodes.map((n) => 'EP' + String(n).padStart(3, '0')));
+  const rows = dossier.rows.filter((row) => wanted.has(row.episode));
+  const keep = new Set();
+  rows.forEach((row, index) => {
+    const c = row.cells;
+    if (c[2] === name || String(c[3] || '').includes(name) || String(c[c.length - 2] || '').includes(name + '=')) { keep.add(index - 1); keep.add(index); keep.add(index + 1); }
+  });
+  const picked = [...keep].filter((i) => i >= 0 && i < rows.length).sort((a, b) => a - b).slice(0, cap);
+  return picked.map((i) => { const c = rows[i].cells; return `| ${rows[i].episode} ${c[0]} | ${c[2]} | ${c[1]} | ${c[3]} | ${c[4]} | ${c[c.length - 2] || ''} |`; });
+}
+
+function cmdReviewSplit() {
+  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const ctx = loadReviewContext(dir);
+  const items = [
+    ...ctx.roles.map((item) => ({ kind: 'role', id: item.id, first: item.episodes[0] || 0, item })),
+    ...ctx.variants.map((item) => ({ kind: 'variant', id: item.id, first: item.episode_list[0] || 0, item }))
+  ].sort((a, b) => a.first - b.first);
+  if (!items.length) { console.log('没有待复核的条目（称谓角色和形象变体都已处理完）。直接 chenyu-pro assets-apply 即可。'); return; }
+  const parts = Math.max(1, Math.min(Number(arg('parts', '')) || Math.ceil(items.length / 8), 8, items.length));
+  const size = Math.ceil(items.length / parts);
+  const packDir = path.join(dir, ASSET_DIR, REVIEW_PACK_DIR);
+  fs.mkdirSync(packDir, { recursive: true });
+  for (const name of fs.readdirSync(packDir)) if (/^第\d+包/.test(name)) fs.rmSync(path.join(packDir, name), { force: true }); // 重新分包时清掉上一轮
+  const named = ctx.labels.filter((x) => !isDescriptiveName(x.name)).map((x) => x.name);
+  for (let p = 0; p < parts; p += 1) {
+    const batch = items.slice(p * size, (p + 1) * size);
+    if (!batch.length) continue;
+    const lines = [
+      `# 复核分包 第 ${p + 1}/${parts} 包（${batch.length} 条，第 ${batch[0].first}–${batch[batch.length - 1].first} 集一带）`,
+      '',
+      '你是复核子代理。只处理这一包里的条目，只根据下面给出的镜头行原文判断，不要改任何其他文件。',
+      `做完把结论写成 JSON 数组，存到同目录的 \`第${p + 1}包.结论.json\`，每条一个对象，\`id\` 和 \`kind\` 原样照抄。`,
+      '',
+      '**称谓角色（kind=role）——他到底是谁？** `decision` 四选一：',
+      '- `merge`：他就是某个已有的具名角色（同一个人被记成了另一个称呼）。`merge_to` 写那个角色名（必须是下面「全剧具名角色」里的，一字不差）。',
+      '- `rename`：剧里的台词、字幕或名牌出现过他的名字。`real_name` 写这个名字。',
+      '- `independent`：确实是没有名字的独立角色。',
+      '- `unsure`：证据不够，判断不了。不要硬选，留给主 Agent。',
+      '每条都要写 `reason`：依据是哪一集哪句台词/哪个镜头（带时间码）。只看衣服相似不算依据。',
+      '',
+      '**形象变体（kind=variant）——这个造型要不要单独建形象？** `decision`：',
+      '- `build`：剧情里有原因、观众需要认出「他变了」（住院、受伤包扎、怀孕、婚礼、伪装、年龄段不同…）。`variant` 写变体名（身份/事件，不用服装名）。',
+      '- `skip`：只是日常换衣、同一身衣服的不同拍法、瞬时状态，或其实是别人的外观被记错了。',
+      '- `unsure`：判断不了。',
+      '每条都要写 `reason`。',
+      '',
+      `全剧具名角色：${named.join('、')}`,
+      ''
+    ];
+    for (const entry of batch) {
+      const it = entry.item;
+      if (entry.kind === 'role') {
+        lines.push(`## [role] ${it.id}`, `- 出现集：${it.episodes.join('、')}；台词 ${it.line_count} 句；外观：${it.looks.join('；') || '无记录'}`, `- 同集出场的具名角色：${it.around.join('、') || '无'}`, '', '| 位置 | 说话人 | 台词 | 动作 | 场景 | 外观 |', '| --- | --- | --- | --- | --- | --- |', ...evidenceRows(ctx.dossier, it.name, it.episodes), '');
+      } else {
+        lines.push(`## [variant] ${it.id}`, `- 角色：${it.role}；造型：${it.look}——${it.description || ''}`, `- 出现集：${it.episodes}；首次：${it.first}；强信号：${it.signals.join('、') || '无'}；平台记录的原因：${it.cause || '无'}${it.main_look ? `；主造型：${it.main_look}` : ''}`, '', '| 位置 | 说话人 | 台词 | 动作 | 场景 | 外观 |', '| --- | --- | --- | --- | --- | --- |', ...evidenceRows(ctx.dossier, it.role, it.episode_list.slice(0, 6), 28), '');
+      }
+    }
+    lines.push('## 结论文件格式', '```json', JSON.stringify(batch.slice(0, 2).map((entry) => (entry.kind === 'role'
+      ? { id: entry.id, kind: 'role', decision: 'merge | rename | independent | unsure', merge_to: '', real_name: '', reason: '' }
+      : { id: entry.id, kind: 'variant', decision: 'build | skip | unsure', variant: '', reason: '' })), null, 1), '```');
+    fs.writeFileSync(path.join(packDir, `第${p + 1}包.md`), lines.join('\n') + '\n', 'utf8');
+  }
+  console.log(`✓ 待复核 ${items.length} 条（称谓角色 ${ctx.roles.length}、形象变体 ${ctx.variants.length}）已分成 ${parts} 包 -> ${packDir}`);
+  console.log('  你的环境能开子代理/并行任务时：每个子代理只给它一个「第N包.md」，让它照文件开头的说明写出「第N包.结论.json」，几包同时跑。');
+  console.log('  不能开子代理就自己按包顺序做，同样写结论文件。子代理不要改合并表。');
+  console.log(`  全部结论写完：chenyu-pro review-merge --dir "${dir}"   合并结论（并人/改名落到合并表，独立/变体落到判定表），再重跑 assets-apply`);
+}
+
+function cmdReviewMerge() {
+  const dir = path.resolve(arg('dir', './chenyu-video-analysis'));
+  const ctx = loadReviewContext(dir);
+  const packDir = path.join(dir, ASSET_DIR, REVIEW_PACK_DIR);
+  if (!fs.existsSync(packDir)) die('还没分包：先 chenyu-pro review-split --dir <分析稿目录>');
+  const results = [];
+  for (const name of fs.readdirSync(packDir).filter((n) => /结论\.json$/.test(n)).sort()) {
+    let list;
+    try { list = JSON.parse(fs.readFileSync(path.join(packDir, name), 'utf8').replace(/^﻿/, '')); } catch (e) { die(`${name} 不是合法 JSON：${e.message}`); }
+    for (const r of Array.isArray(list) ? list : []) if (r && r.id) results.push({ ...r, from: name });
+  }
+  if (!results.length) die(`没有读到结论文件（${packDir} 下的「第N包.结论.json」）`);
+  const raw = JSON.parse(fs.readFileSync(ctx.mapFile, 'utf8').replace(/^﻿/, ''));
+  const roleNames = new Set(ctx.labels.map((x) => x.name));
+  const roleIds = new Set(ctx.roles.map((item) => item.id));
+  const variantIds = new Map(ctx.variants.map((item) => [item.id, item]));
+  const readList = (name) => { const file = path.join(dir, ASSET_DIR, name); try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')) : []; } catch { return []; } };
+  const roleDecisions = new Map(readList(ROLE_DECISION_FILE).map((d) => [d.id, d]));
+  const variantDecisions = new Map(readList(VARIANT_DECISION_FILE).map((d) => [d.id, d]));
+  const text = (value) => String(value || '').trim();
+  const done = { merge: [], rename: [], independent: 0, build: 0, skip: 0 };
+  const left = [];
+  // 把「整理后叫 from 的角色」改成 to：labels 里指向 from 的都指向 to；characters 里的 from 并进 to（改名时保留条目并换名）
+  const redirect = (from, to, { keepAsAlias }) => {
+    for (const [label, value] of Object.entries(raw.labels || {})) {
+      const current = text(value && typeof value === 'object' ? value.to : value);
+      if (current !== from) continue;
+      if (value && typeof value === 'object') value.to = to; else raw.labels[label] = to;
+    }
+    const chars = Array.isArray(raw.characters) ? raw.characters : (raw.characters = []);
+    const source = chars.find((c) => text(c?.name) === from);
+    let target = chars.find((c) => text(c?.name) === to);
+    if (!target) { target = { name: to, role: source?.role || '', aliases: [], note: source?.note || '' }; chars.push(target); }
+    target.aliases = [...new Set([...(target.aliases || []), ...(source?.aliases || []), ...(keepAsAlias ? [from] : [])].map(text).filter((alias) => alias && alias !== to))];
+    if (source && source !== target) chars.splice(chars.indexOf(source), 1);
+  };
+  for (const r of results) {
+    const reason = text(r.reason);
+    if (r.kind === 'role') {
+      if (!roleIds.has(r.id)) continue; // 已经处理过或不在待复核里
+      if (r.decision === 'merge' && text(r.merge_to)) {
+        const to = text(r.merge_to);
+        if (!roleNames.has(to) || to === r.id) { left.push(`${r.id}：merge_to「${to}」不是现有角色名（要和整理版里的名字一字不差）`); continue; }
+        if (reason.length < 8) { left.push(`${r.id}：并到「${to}」但没写依据`); continue; }
+        redirect(r.id, to, { keepAsAlias: false }); // 称谓式的旧名不进别名（别名只留剧里真出现过的叫法）
+        done.merge.push(`${r.id} → ${to}（${reason.slice(0, 40)}）`);
+      } else if (r.decision === 'rename' && text(r.real_name)) {
+        if (reason.length < 8) { left.push(`${r.id}：改名「${text(r.real_name)}」但没写依据（哪一集哪句台词/名牌）`); continue; }
+        redirect(r.id, text(r.real_name), { keepAsAlias: true });
+        done.rename.push(`${r.id} → ${text(r.real_name)}（${reason.slice(0, 40)}）`);
+      } else if (r.decision === 'independent') {
+        if (reason.length < 8) { left.push(`${r.id}：independent 但依据太简略`); continue; }
+        roleDecisions.set(r.id, { ...(roleDecisions.get(r.id) || { id: r.id }), decision: 'independent', reason });
+        done.independent += 1;
+      } else left.push(`${r.id}：子代理没给出结论（${text(r.decision) || '空'}）${reason ? '——' + reason.slice(0, 50) : ''}`);
+    } else if (r.kind === 'variant') {
+      if (!variantIds.has(r.id)) continue;
+      if (r.decision === 'build' && text(r.variant)) { variantDecisions.set(r.id, { ...(variantDecisions.get(r.id) || { id: r.id }), decision: 'build', variant: text(r.variant), reason }); done.build += 1; }
+      else if (r.decision === 'skip' && reason) { variantDecisions.set(r.id, { ...(variantDecisions.get(r.id) || { id: r.id }), decision: 'skip', variant: '', reason }); done.skip += 1; }
+      else left.push(`${r.id}：子代理没给出结论（${text(r.decision) || '空'}）${reason ? '——' + reason.slice(0, 50) : ''}`);
+    }
+  }
+  if (done.merge.length || done.rename.length) {
+    fs.copyFileSync(ctx.mapFile, ctx.mapFile.replace(/\.json$/, `.复核前-${Date.now()}.json`));
+    fs.writeFileSync(ctx.mapFile, JSON.stringify(raw, null, 1), 'utf8');
+  }
+  fs.writeFileSync(path.join(dir, ASSET_DIR, ROLE_DECISION_FILE), JSON.stringify([...roleDecisions.values()], null, 1), 'utf8');
+  fs.writeFileSync(path.join(dir, ASSET_DIR, VARIANT_DECISION_FILE), JSON.stringify([...variantDecisions.values()], null, 1), 'utf8');
+  const answered = new Set(results.map((r) => r.id));
+  for (const item of ctx.roles) if (!answered.has(item.id)) left.push(`${item.id}：没有任何一包给出结论`);
+  for (const item of ctx.variants) if (!answered.has(item.id)) left.push(`${item.id}：没有任何一包给出结论`);
+  console.log(`✓ 已合并 ${results.length} 条结论：并人 ${done.merge.length}、改名 ${done.rename.length}、确认独立 ${done.independent}；形象变体 建 ${done.build}、不建 ${done.skip}`);
+  for (const line of done.merge) console.log('  并人  ' + line);
+  for (const line of done.rename) console.log('  改名  ' + line);
+  if (done.merge.length || done.rename.length) console.log('  合并表已更新（改之前的版本存了一份「资产合并表.复核前-*.json」）。你要抽看这些并人/改名是否合理——子代理看的只是片段。');
+  if (left.length) {
+    console.log(`  ⚠ 还有 ${left.length} 条要你自己定（子代理没把握或结论不合格）：`);
+    for (const line of left.slice(0, 30)) console.log('   - ' + line);
+  }
+  console.log(`  下一步：chenyu-pro assets-apply --dir "${dir}"（并人/改名后名单会变，可能冒出新的待复核条目；还有就再 review-split 一轮）`);
 }
 
 // 存档：把 Agent 本地做出来的东西回传到平台项目里留档（零积分）。只做记录，不改平台的原始分析稿、不改项目状态。
@@ -2972,6 +3149,8 @@ function cmdHelp() {
   chenyu-pro video-wait --project <id片段|剧名> [--out <目录>] [--timeout-min 8]  等分析跑完并自动取回(没跑完退出码3,再跑一次)
   chenyu-pro asset-image --look-table <形象表.json>                         列出可出资产图的条目(零积分)
   chenyu-pro asset-image --project <项目> --look-table <形象表.json> --pick 1,3 [--yes] [--force]  出横版资产图(约6分/张,先报价)
+  chenyu-pro review-split --dir <分析稿目录> [--parts 4]   把待复核的称谓角色/形象变体分包，给子代理并行处理
+  chenyu-pro review-merge --dir <分析稿目录>               合并各包结论到合并表和判定表
   chenyu-pro archive --project <id片段|剧名> --dir <分析稿目录> [--file a.md,b.json]  把合并表/整理版/检查报告存档到平台项目(零积分)
   chenyu-pro archive-fetch --project <id片段|剧名> --dir <分析稿目录> [--force]  取回存档接着做
   chenyu-pro video-fetch --project <id片段|剧名> [--out <目录>]  零积分重新取回最新分析稿(平台修复后用这个取)
@@ -3003,7 +3182,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
