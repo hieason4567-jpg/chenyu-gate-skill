@@ -134,6 +134,43 @@ export function mainHueOf(description) {
   for (const [hue, re] of HUE_WORDS) { const i = m[1].search(re); if (i >= 0 && i < at) { at = i; best = hue; } }
   return best;
 }
+const firstHueOf = (text) => {
+  let best = '', at = Infinity;
+  for (const [hue, re] of HUE_WORDS) { const i = String(text || '').search(re); if (i >= 0 && i < at) { at = i; best = hue; } }
+  return best;
+};
+const COLOR_GARMENT_RE = /(?:[深浅暗亮淡藏墨酒砖米]{0,2})(?:黑|白|灰|蓝|青|绿|红|粉|紫|橙|黄|金|棕|褐|银)色?[一-龥]{0,4}?(?:连衣裙|长裙|短裙|裙|衬衫|长衫|衫|长袍|战袍|袍|上衣|外衣|大衣|风衣|卫衣|毛衣|衣|长裤|裤|外套|西装|夹克|马甲|旗袍|短打|制服)/g;
+/**
+ * 洗稿要重做形象：和原片拉开辨识度。审核结论 looks 每条写 source（原片外观，一两句）和 appearance（重做后的外观锚点，一两句）。
+ * 这里查：没写 source、新旧一样、主色调和原片同色相；并提示正文里还留着的原片服装描写。
+ */
+export function washRedesignIssues(reviewLooks, table, { keep = {}, episodes = [] } = {}) {
+  const issues = [], warnings = [];
+  const kept = (name) => String(keep?.[name] || '').trim().length >= 4;
+  const review = new Map((reviewLooks || []).map((x) => [`${String(x.role || '').trim()}=${String(x.variant || '').trim()}`, x]));
+  const noSource = [], unchanged = [], sameHue = [];
+  for (const c of table.characters || []) for (const l of c.looks || []) {
+    if (kept(c.name)) continue;
+    const r = review.get(`${c.name}=${l.variant}`) || {};
+    const tag = l.tag || `[${c.name}-${l.variant}]`;
+    const source = String(r.source || '').trim(), now = String(r.appearance || l.appearance || '').trim();
+    if (!source) { noSource.push(tag); continue; }
+    if (source === now) { unchanged.push(tag); continue; }
+    const before = firstHueOf(source), after = mainHueOf(l.styling?.description) || firstHueOf(now);
+    if (before && after && before === after) sameHue.push(`${tag}（${before}）`);
+    const design = `${now}${l.styling?.description || ''}`;
+    for (const token of new Set(source.match(COLOR_GARMENT_RE) || [])) {
+      if (token.length < 3 || design.includes(token)) continue;
+      const hits = episodes.reduce((n, ep) => n + String(ep.text).split('\n').filter((line) => line.startsWith('△') && line.includes(c.name) && line.includes(token)).length, 0);
+      if (hits) warnings.push(`「${c.name}」的动作行里还有 ${hits} 处写着原片的「${token}」，新形象已经不是这样了：照新形象改`);
+    }
+  }
+  const head = (list) => `${list.slice(0, 8).join('、')}${list.length > 8 ? ' 等' : ''}`;
+  if (noSource.length) issues.push(`洗稿要重做形象，${noSource.length} 个形象没写原片外观：${head(noSource)}。在 审核结论.json 的 looks 里每条写 source（原片外观，一两句）和 appearance（重做后的外观，一两句）。`);
+  if (unchanged.length) issues.push(`${unchanged.length} 个形象重做前后一字不差：${head(unchanged)}。洗稿要和原片拉开——脸型、发型、主色调、服装款式都换，只保留服装类别和状态（病号服仍是病号服）。`);
+  if (sameHue.length) issues.push(`${sameHue.length} 个形象的主色调和原片是同一个色系：${head(sameHue)}。换一个色相；制式服装或剧情靠颜色认人的，在「保留说明.json」里写 名字: 原因。`);
+  return { issues, warnings };
+}
 const episodeCountOf = (span) => String(span || '').split(/[、,，]/).reduce((sum, part) => {
   const m = part.trim().match(/^(\d+)(?:[–\-~至](\d+))?$/);
   return sum + (m ? Number(m[2] || m[1]) - Number(m[1]) + 1 : 0);

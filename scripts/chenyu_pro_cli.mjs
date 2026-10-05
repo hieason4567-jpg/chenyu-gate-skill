@@ -14,12 +14,14 @@ import { exec, spawn, spawnSync } from 'node:child_process';
 import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, normalizeAssetMap, parseDossier, renderEvidenceFiles } from './asset_workbook.mjs';
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
-import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, isClothingVariantName, lookTableCompleteness, lookTableIssues, lookTableJson, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, isClothingVariantName, lookTableCompleteness, lookTableIssues, lookTableJson, washRedesignIssues, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
 import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals, strongSignals } from './variant_candidates.mjs';
 import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, placeLikeRoleNames, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.30.0 2026-10-05  洗稿（含只改名）默认重做全部形象：审核结论 looks 写 source（原片）和 appearance（重做后），
+//                    assets-export 查没写 source、新旧一样、主色调和原片同色系；正文里残留的原片服装描写列出来。沿用原片写 redesignLooks:none。
 // v2.29.0 2026-10-05  形象设计补全剧配色规划（同场的正式人物主色调同色相会被逐对列出）；原文特征（appearance）不许抄设计稿。
 //                    起因：68 集 148 个形象原文特征和详细描述一字不差，主色调 82 个黑、62 个灰，主角和最常同场的人都是黑。
 // v2.28.0 2026-10-05  视频反推的剧本带原片运镜：△（近景·推）……。1:1 还原每个 △ 都带；洗稿/只改名只带运镜在讲故事的镜头（揭示、情绪特写、仰俯、钩子卡点、转场），普通对话镜头不带。
@@ -206,7 +208,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.29.0';
+const VERSION = '2.30.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -2679,6 +2681,12 @@ const expandEpisodeSpan = (span) => new Set(String(span || '').split(/[、,]/).f
   return Array.from({ length: Math.min(b - a + 1, 200) }, (_, i) => a + i);
 }));
 
+// 洗稿（有名字对照表）默认要重做形象；用户明确要沿用原片形象时在 洗稿映射.json 写 "redesignLooks": "none"
+function washRedesignMode(dir) {
+  const file = washMapPath(dir);
+  if (!fs.existsSync(file)) return false;
+  try { const raw = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); return Object.keys(raw.renames || {}).length > 0 && raw.redesignLooks !== 'none'; } catch { return false; }
+}
 // 每个形象给 Agent 的角色信息：原片外观锚点（审核结论/分析稿）、状态、出现集、剧本里写到他的动作行和台词（判断身份、气质、声线）
 function buildLookInputs(table, episodes, looks) {
   const lookText = new Map((looks || []).map((x) => [`${String(x.role || '').trim()}=${String(x.variant || '').trim()}`, x]));
@@ -2698,6 +2706,8 @@ function buildLookInputs(table, episodes, looks) {
     inputs.set(`${c.name}=${l.variant}`, {
       characterName: `[${c.name}-${l.variant}]`, kind: c.kind, stateLabel: l.variant, stateReason: l.reason || '', isPrimaryState: l.main,
       episodes: l.episodes, appearanceFeatures: lk.appearance || l.appearance || '', sourceActions: actions, sourceLines: lines,
+      // 洗稿：原片外观只作参考身份和状态，不照抄
+      ...(String(lk.source || '').trim() ? { originalAppearance: String(lk.source).trim() } : {}),
     });
   }
   return inputs;
@@ -2796,9 +2806,19 @@ async function cmdLooksPrepare() {
   if (!Array.isArray(existing) || existing.some((e) => e && e.design && !e.styling)) existing = []; // 旧版 design 字段格式不再沿用
   const tpl = lookStylingTemplate(table, existing, buildLookInputs(table, episodes, looks));
   fs.writeFileSync(file, JSON.stringify(tpl, null, 1), 'utf8');
+  const washRedesign = washRedesignMode(dir);
   const task = [
     '# 形象设计任务（和客户端造型 AI 同一套固定流程，思考由你做）',
     '',
+    ...(washRedesign ? [
+      '## 〇、这是洗稿：全部形象要重新设计，不能沿用原片',
+      '目标是和原片拉开辨识度——脸型、发型、主色调、配色、服装款式都换；只保留服装类别和状态（病号服仍是病号服、制服仍是制服、婚纱仍是婚纱）、年龄段、身份。',
+      '- 先在 审核结论.json 的 looks 里把每条写成两栏：source = 原片外观（一两句，照分析稿）；appearance = 重做后的外观（一两句）。写完重跑 looks-prepare，input.originalAppearance 就是原片外观，只用来看身份和状态，不要照抄它的脸、发型、配色、款式。',
+      '- 主色调不能和原片同一个色系；剧本动作行里写到的服装、发型、颜色，要跟着新形象一起改。',
+      '- 制式服装、剧情靠颜色认人的角色照原片，在 保留说明.json 写 名字: 原因。用户明确说沿用原片形象的，在 洗稿映射.json 写 "redesignLooks": "none"。',
+      '- assets-export 会查：没写 source、新旧一样、主色调和原片同色系，都不给通过。',
+      '',
+    ] : []),
     `本剧 ${tpl.length} 个形象。做法：先通读全部形象的角色信息，按第七节先做全剧配色规划（同场的角色主色/发型/脸型错开；同一角色各形象脸、身形、发型、发色一致，只按状态换装），`,
     '再逐条按下面的「输出格式」填写同目录上一级 形象设计.json 里每条的 styling（input 是这个形象的角色信息，只读）。填完跑 `chenyu-pro assets-export --dir <剧本目录>` 检查，直到 STYLING_AUDIT_PASS（那是客户端原样的造型审核，不过就会被客户端打回重调模型扣分）。',
     '',
@@ -2944,6 +2964,12 @@ async function cmdAssetsExport() {
   // 完整性：客户端只收这一张表，缺什么客户端里就缺什么。不完整的表不叫「形象表.json」，免得被当成成品交出去。
   const draftFile = path.join(path.dirname(lookFile), '形象表.未完成.json');
   const incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props'), keep: readKeepNotes(path.dirname(lookFile)) });
+  if (EDITION !== 'gate' && washRedesignMode(dir)) {
+    const redesign = washRedesignIssues(looks, lookTable, { keep: readKeepNotes(path.dirname(lookFile)), episodes });
+    incomplete.push(...redesign.issues);
+    for (const w of redesign.warnings.slice(0, 30)) console.log('  ⚠ ' + w);
+    if (redesign.warnings.length > 30) console.log(`  … 另有 ${redesign.warnings.length - 30} 处`);
+  }
   if (EDITION !== 'gate') {
     if (exportState.stylingAudit === 'fail') incomplete.push('客户端造型审核没通过（STYLING_AUDIT_FAIL）：这样的形象上传后会被客户端打回、重调模型扣用户积分，按上面的明细改「形象设计.json」');
     if (exportState.designProblems) incomplete.push(`场景道具设计还有 ${exportState.designProblems} 处问题（ASSET_DESIGN_FAIL）：按上面的明细改「场景道具设计.json」`);
