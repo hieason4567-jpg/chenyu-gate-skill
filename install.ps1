@@ -3,7 +3,7 @@
 # 装到 Codex + Claude Code 的 skills 目录，并创建全局 chenyu-gate 命令。需 Node 18+。
 $ErrorActionPreference = "Stop"
 $repo = "https://raw.githubusercontent.com/hieason4567-jpg/chenyu-gate-skill/main"
-$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs", "scripts/chenyu_pro_cli.mjs", "scripts/net.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs", "scripts/variant_candidates.mjs", "scripts/merge_review.mjs", "scripts/durations.mjs", "scripts/remake.mjs", "scripts/styling_static.json", "scripts/excel_import.mjs", "scripts/storyboard_audit.mjs", "scripts/superi_lookup.mjs", "references/分镜写作守则.md")
+$files = @("SKILL.md", "scripts/chenyu_gate_cli.mjs", "scripts/chenyu_pro_cli.mjs", "scripts/net.mjs", "scripts/asset_workbook.mjs", "scripts/wash_check.mjs", "scripts/deliver_check.mjs", "scripts/asset_export.mjs", "scripts/variant_candidates.mjs", "scripts/merge_review.mjs", "scripts/text_analyze.mjs", "scripts/durations.mjs", "scripts/remake.mjs", "scripts/styling_static.json", "scripts/excel_import.mjs", "scripts/storyboard_audit.mjs", "scripts/superi_lookup.mjs", "references/分镜写作守则.md")
 
 $roots = @()
 $roots += Join-Path $env:USERPROFILE ".codex\skills"
