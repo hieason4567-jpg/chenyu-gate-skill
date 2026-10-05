@@ -20,6 +20,7 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.30.1 2026-10-05  原片自带的语病（叠字、同一句念两遍、病句、错别字）要修不照抄，只修毛病不润色，逐处登记 dialogue_changes。
 // v2.30.0 2026-10-05  洗稿（含只改名）默认重做全部形象：审核结论 looks 写 source（原片）和 appearance（重做后），
 //                    assets-export 查没写 source、新旧一样、主色调和原片同色系；正文里残留的原片服装描写列出来。沿用原片写 redesignLooks:none。
 // v2.29.0 2026-10-05  形象设计补全剧配色规划（同场的正式人物主色调同色相会被逐对列出）；原文特征（appearance）不许抄设计稿。
@@ -208,7 +209,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.30.0';
+const VERSION = '2.30.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
