@@ -118,7 +118,26 @@ export function assetListJson({ people, scenes, props, creatureSet }) {
     props: [...props.entries()].map(([name, pr]) => ({ name, owners: [...pr.owners], states: [...pr.states], counts: [...pr.counts], episodes: [...pr.eps].sort((a, b) => a - b) }))
   };
 }
-const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$|群$|人群|群众|围观[一-龥]{1,3}$|一群|一众|众人|(?<![观听公大民受])众[一-龥]{1,3}$/;
+const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$|群$|人群|群众|观众$|民众$|围观[一-龥]{1,3}$|一群|一众|众人|(?<![观听公大民受])众[一-龥]{1,3}$/;
+// 设计稿的分段标记：原文特征里出现三个以上，说明把设计稿抄进去了
+const DESIGN_SEGMENT_MARKERS = ['脸部：', '身材：', '服饰类型：', '主色调：', '部件配色：', '视觉锚点：'];
+export const looksLikeDesignText = (text) => DESIGN_SEGMENT_MARKERS.filter((m) => String(text || '').includes(m)).length >= 3;
+// 主色调归到色相：取「主色调：」后面最先出现的那个颜色词
+const HUE_WORDS = [
+  ['黑', /黑|墨色|炭/], ['白', /白|象牙|乳色/], ['灰', /灰|银/], ['蓝', /蓝|藏青|靛/], ['青', /青绿|孔雀|青色|湖绿|松石/], ['绿', /绿|橄榄/],
+  ['红', /红|朱|绯|赤/], ['粉', /粉/], ['紫', /紫|梅色/], ['橙', /橙|橘/], ['黄', /黄|金|香槟/], ['棕', /棕|褐|咖|驼|卡其|土色/],
+];
+export function mainHueOf(description) {
+  const m = String(description || '').match(/主色调：([^。]+)/);
+  if (!m) return '';
+  let best = '', at = Infinity;
+  for (const [hue, re] of HUE_WORDS) { const i = m[1].search(re); if (i >= 0 && i < at) { at = i; best = hue; } }
+  return best;
+}
+const episodeCountOf = (span) => String(span || '').split(/[、,，]/).reduce((sum, part) => {
+  const m = part.trim().match(/^(\d+)(?:[–\-~至](\d+))?$/);
+  return sum + (m ? Number(m[2] || m[1]) - Number(m[1]) + 1 : 0);
+}, 0);
 // 建卡原因里承认「它和另一件道具是同一样东西」的说法
 const SAME_ENTITY_RE = /同一(?:实体|件|台|个|把|辆|本|机)|为同[一场]|沿用.{0,12}外观|复用|后续称谓|另一(?:种)?(?:称谓|叫法)/;
 const CREATURE_RE = /蛊|虫|蛾|蟾|蛙|螳螂|蜂|蛛|蝶|鸭|鹅|鸵鸟|鸟|兽|蛇|狐|猫|狗|犬|兔|龟|鼠|狼|熊/;
@@ -358,6 +377,36 @@ export function lookTableCompleteness(table, { episodes = [], requireDesign = tr
       + `是同一件东西 → 统一成一个名字、一张卡；`
       + `是不同的人各自拿的普通物件（手机、话筒、出租车、电脑）→ 不建卡（card:false），客户端按文字描述就能画，观众也不会认它长什么样；`
       + `确实是外观不同、都要前后一致的两件东西 → 在「保留说明.json」里写 名字: 两件外观上差在哪。`);
+  }
+  // ⑤ 原文特征（look.appearance）是原片的外观锚点，一两句话；设计稿（styling.description）才是逐段的详细描述。
+  //    把设计稿原样抄进原文特征：客户端里两栏一模一样，而且原文特征里写了颜色就会锁死配色、客户端不再错开。
+  const designLike = [];
+  for (const c of chars) for (const l of c.looks || []) {
+    const a = String(l.appearance || '').trim();
+    if (a && (looksLikeDesignText(a) || (l.styling && a === String(l.styling.description || '').trim()))) designLike.push(l.tag || `${c.name}-${l.variant}`);
+  }
+  if (designLike.length) {
+    issues.push(`${designLike.length} 个形象的原文特征（审核结论 looks 的 appearance）写成了设计稿：${designLike.slice(0, 8).join('、')}${designLike.length > 8 ? ' 等' : ''}。`
+      + `原文特征只写原片里看得到的一两句（约七十岁老妇人，灰白盘发，拄竹拐杖，深青色绣纹长袍），不分「脸部／身材／部件配色／视觉锚点」这些段；逐段的详细描述只写在 形象设计.json 的 styling.description 里。`);
+  }
+  // ⑥ 同场出现的正式人物主色调撞了（和客户端的全剧配色规划同一个目的：同框的人一眼分得开）
+  const formal = chars.filter((c) => c.kind === 'human' && episodeCountOf(c.episodes) >= 3);
+  const hueOf = new Map();
+  for (const c of formal) { const main = (c.looks || []).find((l) => l.main) || (c.looks || [])[0]; const hue = mainHueOf(main?.styling?.description); if (hue) hueOf.set(c.name, hue); }
+  const shared = new Map();
+  for (const scenes of Object.values(table.scenes || {})) for (const cast of Object.values(scenes || {})) {
+    const names = Object.keys(cast || {}).filter((n) => hueOf.has(n));
+    for (let i = 0; i < names.length; i += 1) for (let j = i + 1; j < names.length; j += 1) {
+      if (hueOf.get(names[i]) !== hueOf.get(names[j])) continue;
+      const key = [names[i], names[j]].sort().join('｜');
+      shared.set(key, (shared.get(key) || 0) + 1);
+    }
+  }
+  const clashes = [...shared.entries()].filter(([key]) => !key.split('｜').some((n) => kept(n))).sort((a, b) => b[1] - a[1]);
+  if (clashes.length) {
+    issues.push(`${clashes.length} 对同场出现的正式人物主色调是同一个色系：${clashes.slice(0, 10).map(([key, n]) => `${key.replace('｜', '／')}（${hueOf.get(key.split('｜')[0])}，同场 ${n} 次）`).join('、')}${clashes.length > 10 ? ' 等' : ''}。`
+      + `先做全剧配色规划（形象设计任务第七节）：同场的人主色调错开色相，只换深浅或换个叫法不算；改 styling.description 的「主色调」「部件配色」。`
+      + `原片里就是同一套制服、或剧情靠颜色认人（白衣、黑衣）的，在「保留说明.json」里写 名字: 原因。`);
   }
   return issues;
 }
