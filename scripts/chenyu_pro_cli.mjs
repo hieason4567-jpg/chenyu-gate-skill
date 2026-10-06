@@ -20,6 +20,7 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.31.1 2026-10-06  sync 不写 --look-table 时自动带上项目目录里的完整形象表；没带上表时明说原因（平台不再塞只有人物名的简表）。
 // v2.31.0 2026-10-05  新增 text-analyze：现成剧本（程序直接转）和小说（Agent 逐段提取）整理成和视频分析同一种分析稿，
 //                    从资产整理起三种输入走同一条链路（assets-prepare → assets-apply → 建议 → 用户确认 → 写）。没有资产合并表不许动笔。
 // v2.30.2 2026-10-05  语病里的叠字只修出错造成的（卡壳多念的字），正常叠词、称呼、拟声、故意重复强调一律不动。
@@ -212,7 +213,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.31.0';
+const VERSION = '2.31.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -529,11 +530,19 @@ async function cmdSync() {
     lookTable = loadLookTableOrDie(path.resolve(tableArg));
     if (lookTable.complete !== true) die(`这份形象表不完整（没有 LOOK_TABLE_PASS），不能同步给客户端：${path.resolve(tableArg)}\n  先 chenyu-pro assets-export 到 LOOK_TABLE_PASS`);
   }
+  // 没写 --look-table：自己去项目目录找导出好的完整形象表，找到就带上（以前不写就不带，平台塞一张只有人物名的简表进去，用户以为是全的）
+  if (!lookTable) {
+    const candidates = [path.join(projectDir(p.title), '形象表.json'), path.join(projectDir(String(p.title).replace(/[·\s]*\d+集反推$/, '')), '形象表.json')];
+    for (const file of candidates) {
+      if (!fs.existsSync(file)) continue;
+      try { const table = JSON.parse(fs.readFileSync(file, 'utf8').replace(/^﻿/, '')); if (table.schema === 'chenyu.look-table/v1' && table.complete === true) { lookTable = table; console.log(`  形象表：自动带上 ${file}`); break; } } catch { /* 读不了就当没有 */ }
+    }
+  }
   const res = await api(`/api/projects/${p.id}/cloud-sync`, { method: 'POST', body: lookTable ? { look_table: lookTable } : {}, timeoutMs: 120000 });
   console.log(`✓ 已同步到云端脚本库：《${p.title}》${res.episodes} 集`);
   if (Array.isArray(res.missing_episodes) && res.missing_episodes.length) { console.log(`  ⛔ 集号不连续，缺第 ${res.missing_episodes.join('、')} 集——这几集没有回传过正文。补 save 后重新 sync，不要让用户拿到缺集的剧本。`); process.exitCode = 2; }
   console.log(res.look_table === 'agent' ? '  形象表：已带上完整形象表（角色造型、场景、道具都按表建卡）'
-    : '  形象表：这次没带完整形象表，客户端只拿到正文里扫出的角色和形象名，造型、场景、道具由客户端自己做。要带上：加 --look-table <形象表.json>（或让用户在客户端手动上传）');
+    : `  ⛔ 形象表：这次同步【没有带形象表】${res.look_table_problem ? `——${res.look_table_problem}` : ''}。客户端会自己从剧本里重新设计角色、场景和道具，你做的形象设计用不上。\n     要带上：先 chenyu-pro assets-export 到 LOOK_TABLE_PASS，再 sync --look-table <形象表.json>。把这一点原样告诉用户，不要说「已同步完成」了事。`);
   console.log('  辰屿客户端"云端脚本"点刷新即可下载（需与 CLI 用同一积分 KEY）');
 }
 
