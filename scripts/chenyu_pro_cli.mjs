@@ -20,6 +20,8 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.32.0 2026-10-07  新增 next：写作阶段的工作单（全剧每集的状态 + 现在要改哪个文件哪一行、要写哪一集），用户说「继续」先跑它再动手。
+//                    洗稿检查：原片字幕断句和剧本断句不在同一处、几句连起来包含原句的，算保留。
 // v2.31.2 2026-10-07  洗稿检查：原台词被拆成同一人连着说的两三句、或两句并成一句，都算保留（不再和格式门的「台词超长要拆」互相打架）。
 //                    规则：检查没过、写完一批都不是停下来的理由；首批 3 集之后一口气写到底；三个检查一起跑一起改。
 // v2.31.1 2026-10-06  sync 不写 --look-table 时自动带上项目目录里的完整形象表；没带上表时明说原因（平台不再塞只有人物名的简表）。
@@ -215,7 +217,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.31.2';
+const VERSION = '2.32.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -265,7 +267,7 @@ const args = process.argv.slice(2);
 const EDITION = process.env.CHENYU_EDITION === 'gate' ? 'gate' : 'pro';
 // 免费版老用法「chenyu-gate --file 剧本.txt / --dir 目录」= 格式门
 const cmd = EDITION === 'gate' && /^--(file|dir)$/.test(args[0] || '') ? 'gate' : (args[0] || 'help');
-const GATE_COMMANDS = new Set(['gate', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
+const GATE_COMMANDS = new Set(['gate', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
   'remake-prepare', 'remake-units', 'remake-lint', 'remake-review', 'remake-apply', 'guide', 'help', 'version', '--version', '-v']);
 const CLI_NAME = EDITION === 'gate' ? 'chenyu-gate' : 'chenyu-pro';
 if (EDITION === 'gate') {
@@ -2651,6 +2653,76 @@ function cmdWashCheck() {
   console.log(`WASH_PASS${warnings.length ? `（警告${warnings.length}处，逐条看一眼）` : ''}`);
 }
 
+// next：写作阶段的工作单。纯本地、零积分、不联网。
+// 起因（2026-10-07）：70 集的项目，Agent 每写 3 集就停下来汇报「第 N–M 集还差校验」，用户说「继续」它只回一句「我会继续处理」又停——
+// 它不知道「继续」具体是做哪一件事。这个命令把全剧每一集的状态算出来，直接给出下一步要改哪个文件的哪一行、要写哪一集。
+function cmdNext() {
+  const dir = path.resolve(arg('dir', '') || die('用法: chenyu-pro next --dir <剧本目录> [--source <分析稿目录>]'));
+  if (!fs.existsSync(dir)) die('目录不存在: ' + dir);
+  let srcDir = arg('source', '');
+  if (!srcDir) { try { srcDir = String(loadConfig().last_analysis_dir || ''); } catch { srcDir = ''; } }
+  const dossierFile = srcDir ? (fs.existsSync(srcDir) && fs.statSync(srcDir).isFile() ? srcDir : [path.join(srcDir, '整理版', DOSSIER_FILE), path.join(srcDir, DOSSIER_FILE)].find((f) => fs.existsSync(f)) || '') : '';
+  let dossierText = '', sourceEpisodes = [];
+  if (dossierFile) { try { dossierText = fs.readFileSync(dossierFile, 'utf8'); sourceEpisodes = [...new Set(parseDossier(dossierText).rows.map((row) => Number(String(row.episode).replace(/\D/g, ''))))].filter((n) => n > 0).sort((a, b) => a - b); } catch { dossierText = ''; } }
+  const files = new Map(listScriptFiles(dir).map((f) => [episodeNoOfFile(path.basename(f)), f]).filter(([n]) => n > 0));
+  const mapFile = washMapPath(dir);
+  let map = null;
+  if (fs.existsSync(mapFile)) { try { const raw = JSON.parse(fs.readFileSync(mapFile, 'utf8').replace(/^﻿/, '')); if (raw.confirmed !== false && Object.keys(raw.renames || {}).length) map = normalizeWashMap(raw); } catch { map = null; } }
+  let dialogueChanges = [];
+  for (const cand of [path.join(dir, REVIEW_FILE), path.join(dir, '..', REVIEW_FILE)]) {
+    if (fs.existsSync(cand)) { try { dialogueChanges = JSON.parse(fs.readFileSync(cand, 'utf8').replace(/^﻿/, '')).dialogue_changes || []; } catch { dialogueChanges = []; } break; }
+  }
+  const all = [...new Set([...sourceEpisodes, ...files.keys()])].sort((a, b) => a - b);
+  if (!all.length) die('目录里没有「第N集」剧本，也没找到分析稿（加 --source <分析稿目录>）');
+  const { table } = loadVariantTable(dir);
+  const ctx = newVariantContext(table);
+  const ok = [], fix = [], todo = [];
+  for (const n of all) {
+    const file = files.get(n);
+    if (!file) { todo.push(n); continue; }
+    ctx.episode = n;
+    const text = fs.readFileSync(file, 'utf8');
+    const issues = gateOneScript(text, ctx).errors.map((e) => `格式：${e}`);
+    if (map && dossierText && sourceEpisodes.includes(n)) {
+      try {
+        const r = washCheck({ episodes: [{ n, text }], dossierText, map });
+        issues.push(...r.errors.map((e) => `换名：${e.replace(/^第\d+集:/, '第')}`.replace('换名：第', '换名：第 ').replace(/(\d+) /, '$1 行 ')));
+        // 登记过理由的改动（识别错字、语病、设定词）不算问题，和交付门同一个口径
+        const sameLine = (a, b) => { const x = String(a || ''), y = String(b || ''); return Boolean(x && y) && (x.includes(y.slice(0, 8)) || y.includes(x.slice(0, 8))); };
+        const justified = (m) => dialogueChanges.some((c) => Number(String(c.where || '').match(/\d+/)?.[0]) === n && c.reason && (!c.source || sameLine(m.source, c.source) || sameLine(m.source, applyRenames(String(c.source), map.renames).text)));
+        for (const m of r.missing.filter((item) => !justified(item))) issues.push(`原台词对不上${m.line ? `（第 ${m.line} 行附近）` : ''}：原片「${String(m.source).slice(0, 40)}」${m.now ? `，现在写成「${String(m.now).slice(0, 30)}」` : '，剧本里没有对应的句子'}——是改写了就照原句放回；原片本身是识别错字或语病、你是改对了，就登记到 审核结论.json 的 dialogue_changes（原句 + 理由），不要改回错的`);
+      } catch { /* 这一集比不了就只看格式 */ }
+    }
+    if (issues.length) fix.push({ n, file, issues }); else ok.push(n);
+  }
+  const span = (list) => { const out = []; let a = null, b = null; for (const n of list) { if (a === null) { a = b = n; } else if (n === b + 1) { b = n; } else { out.push(a === b ? `${a}` : `${a}–${b}`); a = b = n; } } if (a !== null) out.push(a === b ? `${a}` : `${a}–${b}`); return out.join('、'); };
+  console.log(`NEXT  全剧 ${all.length} 集：已写好并通过 ${ok.length} 集${ok.length ? `（第 ${span(ok)} 集）` : ''}；要改 ${fix.length} 集${fix.length ? `（第 ${span(fix.map((x) => x.n))} 集）` : ''}；还没写 ${todo.length} 集${todo.length ? `（第 ${span(todo)} 集）` : ''}`);
+  if (!dossierText) console.log('  （没读到分析稿，只查了格式；加 --source <分析稿目录> 才能查原台词和知道全剧共几集）');
+  if (!fix.length && !todo.length) {
+    console.log('ALL_DONE  每一集都写完并通过了。接着做：chenyu-pro save --dir 回传 → durations → deliver-check → assets-export → sync。');
+    return;
+  }
+  console.log('■ 这是工作单，不是让你汇报的。不要回复用户「我会继续」，现在就从第 1 条开始动手；做完这几条再跑一次 chenyu-pro next，直到出现 ALL_DONE。');
+  let step = 0;
+  for (const item of fix.slice(0, 6)) {
+    step += 1;
+    console.log(`  ${step}. 改 ${item.file}（${item.issues.length} 处）：`);
+    for (const issue of item.issues.slice(0, 12)) console.log(`       ✗ ${issue}`);
+    if (item.issues.length > 12) console.log(`       … 另有 ${item.issues.length - 12} 处：chenyu-pro gate --file "${item.file}"`);
+  }
+  if (fix.length > 6) console.log(`  …另有 ${fix.length - 6} 集要改，改完上面的再跑 next 会列出来`);
+  // 新文件名照目录里已有的写法（第001集.txt / 第001集正文.txt）
+  const sample = [...files.values()][0] ? path.basename([...files.values()][0]) : '第001集.txt';
+  const nameFor = (n) => sample.replace(/第\s*\d+\s*集/, `第${String(n).padStart(3, '0')}集`);
+  for (const n of todo.slice(0, 5)) {
+    step += 1;
+    console.log(`  ${step}. 写第 ${n} 集：读分析稿里 EP${String(n).padStart(3, '0')} 的镜头表，逐镜头手写，存成 ${path.join(dir, nameFor(n))}`);
+  }
+  if (todo.length > 5) console.log(`  …后面还有 ${todo.length - 5} 集没写，写完这 5 集再跑 next`);
+  console.log('  写法（一次同时过格式门和洗稿检查）：一句原台词一行；每句台词前有一行 △；超过 40 字的原台词在标点处断成同一个人连着说的两句、中间隔一行 △。');
+  console.log(`  每通过 5 集回传一次：chenyu-pro save --project <项目> --dir "${dir}"（不用等全部写完，也不用为此停下来问用户）。`);
+}
+
 // deliver-check：洗稿交付门。机器指标 + 审核结论.json（剧情完整/对话称呼/剧情逻辑）全部达标才 DELIVERY_PASS；
 // 不达标时列出"下一轮要做的事"，Agent 照单修改后重跑，循环到通过为止。
 function cmdDeliverCheck() {
@@ -3553,6 +3625,7 @@ function cmdHelp() {
   chenyu-pro create --title <剧名> --episodes 30 [--market us_en]   建项目壳(零积分，不触发平台生成)
   chenyu-pro save --project <id片段> --episode 1 --file 第001集.txt  回传 Agent 写好的一集正文
   chenyu-pro save --project <id片段> --dir <目录>          批量回传(文件名含 第N集 的 .txt/.md)
+  chenyu-pro next --dir <剧本目录> [--source <分析稿目录>]   工作单：哪几集通过/要改/没写，现在该做哪几件事(用户说"继续"先跑它)
   chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词/形象标记)，改到 GATE_PASS
   chenyu-pro variants --dir <剧本目录> --source <分析稿目录>            对照资产整理时定的形象变体，查剧本有没有漏用(到 VARIANTS_PASS)
   chenyu-pro variants --dir <目录> [--out 文件]           从正文【形象】标记汇总形象变体表（每人几个变体、出现在哪几集哪几场）
@@ -3602,7 +3675,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);

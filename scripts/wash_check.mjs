@@ -241,7 +241,9 @@ export function washCheck({ episodes, dossierText, map }) {
             let joined = dialogue[i].text;
             for (let j = i + 1; j < Math.min(dialogue.length, i + 4) && dialogue[j].who === dialogue[i].who; j += 1) {
               joined += dialogue[j].text;
-              const r = similarity(joined, s);
+              // 原片字幕的断句和剧本的断句不在同一处（原句是「…九重震拳！我居然在一瞬间」，剧本断成「…九重震拳！」「我居然在一瞬间…」）：
+              // 这几句连起来包含原句，就是原话还在
+              const r = want.length >= 4 && bare(joined).includes(want) ? 1 : similarity(joined, s);
               if (r > best) { best = r; at = dialogue[i]; }
             }
           }
