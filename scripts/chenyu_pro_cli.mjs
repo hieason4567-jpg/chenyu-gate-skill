@@ -20,6 +20,8 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.31.2 2026-10-07  洗稿检查：原台词被拆成同一人连着说的两三句、或两句并成一句，都算保留（不再和格式门的「台词超长要拆」互相打架）。
+//                    规则：检查没过、写完一批都不是停下来的理由；首批 3 集之后一口气写到底；三个检查一起跑一起改。
 // v2.31.1 2026-10-06  sync 不写 --look-table 时自动带上项目目录里的完整形象表；没带上表时明说原因（平台不再塞只有人物名的简表）。
 // v2.31.0 2026-10-05  新增 text-analyze：现成剧本（程序直接转）和小说（Agent 逐段提取）整理成和视频分析同一种分析稿，
 //                    从资产整理起三种输入走同一条链路（assets-prepare → assets-apply → 建议 → 用户确认 → 写）。没有资产合并表不许动笔。
@@ -213,7 +215,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.31.1';
+const VERSION = '2.31.2';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 

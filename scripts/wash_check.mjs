@@ -231,6 +231,21 @@ export function washCheck({ episodes, dossierText, map }) {
       for (const s of src) {
         let best = 0, at = null;
         for (const d of dialogue) { const r = similarity(d.text, s); if (r > best) { best = r; at = d; } }
+        // 原句还在、只是分行不同，也算保留——否则会和格式门互相打架：格式门嫌一句台词超过 40 字要拆成两句，
+        // 拆了这里又说「原台词没保留」；改回一整句格式门又报超长，Agent 在两个检查之间来回改、永远交不了。
+        // ① 一句原台词被拆成同一个人连着说的两三句（中间可以隔动作行）；② 原片被字幕切开的两句并成了一句。
+        if (best < KEEP_MATCH) {
+          const want = bare(s);
+          if (want.length >= 4 && dialogue.some((d) => bare(d.text).includes(want))) best = 1;
+          for (let i = 0; i < dialogue.length && best < KEEP_MATCH; i += 1) {
+            let joined = dialogue[i].text;
+            for (let j = i + 1; j < Math.min(dialogue.length, i + 4) && dialogue[j].who === dialogue[i].who; j += 1) {
+              joined += dialogue[j].text;
+              const r = similarity(joined, s);
+              if (r > best) { best = r; at = dialogue[i]; }
+            }
+          }
+        }
         if (best >= KEEP_MATCH) retained++;
         else missing.push({ n, source: s, best, now: at ? at.text : '', line: at ? at.line : 0 });
       }
