@@ -20,6 +20,11 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.33.0 2026-10-19  集号 / 场次号规范：gate 和 save 查集头「第NNN集 标题」的集号 = 本集集号、场次号前缀 = 集号、序号从 1 连续，
+//                    合并文件里集号不重复不跳号，gate --dir 查文件名集号重复和缺集（实例：第 33 集集头写成第003集，客户端第 3 集被盖掉）。
+//                    新增 renumber：按规范自动改集头和场次号（留 .bak）。
+//                    video-analyze 分批：--start N 指定这一批从第几集起；追加到已有项目时文件名又是 1..k 且都已分析过，自动接着往下编；
+//                    没写 --project 但已有同名视频分析项目时拦下，提示追加命令（不再另建项目又从第 1 集编起）。
 // v2.32.0 2026-10-07  新增 next：写作阶段的工作单（全剧每集的状态 + 现在要改哪个文件哪一行、要写哪一集），用户说「继续」先跑它再动手。
 //                    洗稿检查：原片字幕断句和剧本断句不在同一处、几句连起来包含原句的，算保留。
 // v2.31.2 2026-10-07  洗稿检查：原台词被拆成同一人连着说的两三句、或两句并成一句，都算保留（不再和格式门的「台词超长要拆」互相打架）。
@@ -217,7 +222,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.32.0';
+const VERSION = '2.33.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -267,7 +272,7 @@ const args = process.argv.slice(2);
 const EDITION = process.env.CHENYU_EDITION === 'gate' ? 'gate' : 'pro';
 // 免费版老用法「chenyu-gate --file 剧本.txt / --dir 目录」= 格式门
 const cmd = EDITION === 'gate' && /^--(file|dir)$/.test(args[0] || '') ? 'gate' : (args[0] || 'help');
-const GATE_COMMANDS = new Set(['gate', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
+const GATE_COMMANDS = new Set(['gate', 'renumber', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
   'remake-prepare', 'remake-units', 'remake-lint', 'remake-review', 'remake-apply', 'guide', 'help', 'version', '--version', '-v']);
 const CLI_NAME = EDITION === 'gate' ? 'chenyu-gate' : 'chenyu-pro';
 if (EDITION === 'gate') {
@@ -604,6 +609,14 @@ const matchDialogue = (l) => {
 const isVariantLine = (l) => /^【形象】/.test(l);
 const VARIANT_PLACEHOLDER_RE = /^(?:基础形象|基本形象|默认形象|主形象|默认|主状态|基础|日常|日常装|日常服|常服|常态|常规|初始|初始形象|原样|同上|不变|default|base|basic)$/iu;
 const VOICE_ONLY_NOTE_RE = /画外音|电话|视频里|视频通话|录音|对讲|OS|旁白|VO|广播|心声|内心/i;
+// 解说型旁白(替观众解释画面的那种), 不含"电话里/视频里"这类同场发声。
+const NARRATION_SPEAKER_RE = /^(?:旁白|解说|字幕|独白|内心独白|OS|VO)(?:[（(][^）)]*[）)])?$/i;
+const NARRATION_NOTE_RE = /画外音|旁白|独白|心声|内心|OS|VO/i;
+const isNarrationDialogue = (d) => Boolean(d) && (NARRATION_SPEAKER_RE.test(d.speaker.replace(/\s+/g, ''))
+  || (NARRATION_NOTE_RE.test(`${d.note}`) && /旁白|解说|独白/.test(d.speaker)));
+// △闪回/回忆/梦境 起头 = 另一个时空的画面, 必须单独成场次(分镜只认场次头, 混写会按当前场景配景)。
+const FLASHBACK_ACTION_RE = /^(?:[（(][^）)]*[）)])?\s*(闪回|回忆|梦境|梦中|倒叙)\s*[：:]/;
+const FLASHBACK_SCENE_RE = /回忆|闪回|梦境|梦中|倒叙/;
 // 场内换形象要有可见的换装/受伤类动作，且△里写到这个人
 const VARIANT_CHANGE_ACTION_RE = /换|穿|脱|披|套上|系上|解开|解下|扯下|摘下|戴上|包扎|缠上|剪|剃|染|卸妆|化妆|淋湿|溅|受伤|流血|撕破|撕开|更衣|裹上/;
 function parseVariantLine(l) {
@@ -721,6 +734,8 @@ function checkVariants(rawLines, ctx, errors, warnings) {
 function gateOneScript(text, ctx = newVariantContext()) {
   const rawLines = String(text).split(/\r?\n/);
   const errors = [], warnings = [];
+  // 集号 / 场次号（v2.33.0）：集头集号 = 本集集号、场次号前缀 = 集号、序号从 1 连续；合并文件里集号不重复不跳号
+  errors.push(...checkNumbering(text, ctx.episode || 0));
   let dlgCount = 0, actCount = 0, silentBurstStart = -1;
   let run = [];                 // 当前连续台词行 [{ line, speaker }]
   const flushRun = () => {
@@ -737,6 +752,8 @@ function gateOneScript(text, ctx = newVariantContext()) {
   let inSceneIntro = false;  // 是否处在"场次头之后、首个△/台词之前"（环境描述行允许区）
   const actionSeen = new Map(); // △正文 → 出现行号（重复△检测）
   let sceneHead = null, sceneBuf = []; // 当前场景的△/画面文字（载具进出连续性检测）
+  // 哑蒙太奇检测(2026-10-09 实拍暴露): 一串△之后才出现解说旁白 → 分镜照行序拍, 前面那串画面全程无人声。
+  let actionRunLen = 0, actionRunStart = -1, narrationLed = false;
   const flushScene = () => {
     if (sceneHead) checkVehicleSceneContinuity(sceneHead, sceneBuf, warnings);
     sceneBuf = [];
@@ -754,6 +771,12 @@ function gateOneScript(text, ctx = newVariantContext()) {
       actCount++;
       const body = l.slice(1).trim();
       sceneBuf.push(body);
+      if (actionRunLen === 0) actionRunStart = ln;
+      actionRunLen++;
+      if (FLASHBACK_ACTION_RE.test(body) && !(sceneHead && FLASHBACK_SCENE_RE.test(sceneHead))) {
+        errors.push(`第${ln}行 闪回/回忆写在普通场次里（${body.slice(0, 24)}）→ 另一个时空要单独成场次，`
+          + `例「2-2 夜 内 回忆·周涛家·浴室」，否则分镜会按当前场景「${(sceneHead || '').split(/\s+/).pop() || '本场'}」配景出图`);
+      }
       if (GATE_MENTAL_RE.test(body)) errors.push(`第${ln}行 △写了心理活动（${(body.match(GATE_MENTAL_RE) || [''])[0]}）→ △只写可见的外部动作与神态，把心理翻译成身体反应`);
       if (GATE_TIMECODE_RE.test(body)) errors.push(`第${ln}行 △里写了时间码（${(body.match(GATE_TIMECODE_RE) || [''])[0].trim()}）→ 剧本不写时间码，删掉，直接写可见动作`);
       if (GATE_FILLER_RE.test(body)) errors.push(`第${ln}行 △是万能填充句/占位话（${(body.match(GATE_FILLER_RE) || [''])[0]}）→ 写该时刻具体谁做了什么可见动作（分析表 visible_action 那一列就是素材），不要用空话占位`);
@@ -766,14 +789,26 @@ function gateOneScript(text, ctx = newVariantContext()) {
     }
     // 人物行、画面/镜头描述块：合法结构行，放行不计叙述。
     if (isCharacterListLine(l) || isPictureLine(l)) { flushRun(); continue; }
-    if (isSceneHead(l)) { flushRun(); flushScene(); sceneHead = l; inSceneIntro = true; continue; }
-    if (isEpTitle(l)) { flushRun(); flushScene(); sceneHead = null; continue; }
+    if (isSceneHead(l)) { flushRun(); flushScene(); sceneHead = l; inSceneIntro = true; actionRunLen = 0; narrationLed = false; continue; }
+    if (isEpTitle(l)) { flushRun(); flushScene(); sceneHead = null; actionRunLen = 0; narrationLed = false; continue; }
     if (isMetaLine(l)) { flushRun(); sceneBuf.push(l.replace(/^【[^】]*】/, '')); continue; }
     if (isVariantLine(l)) { flushRun(); continue; }
     const d = matchDialogue(l);
     if (d) {
       dlgCount++;
       inSceneIntro = false;
+      // 解说旁白排在一串△之后 = 哑蒙太奇: 分镜照行序拍, 前面那串画面全程没人声, 观众看不懂在讲什么。
+      if (isNarrationDialogue(d)) {
+        if (actionRunLen >= 3 && !narrationLed) {
+          errors.push(`第${ln}行 解说旁白排在${actionRunLen}个连续△之后（第${actionRunStart}-${ln - 1}行）→ `
+            + `把起头那句旁白移到第${actionRunStart}行之前领着画面走，点题那句才留在段尾；`
+            + `否则这段画面转分镜后全程无人声`);
+        }
+        narrationLed = true;
+      } else {
+        narrationLed = false;
+      }
+      actionRunLen = 0;
       run.push({ line: ln, speaker: d.speaker });
       if (d.body.length > 40) warnings.push(`第${ln}行 台词超长（${d.body.length}字）——超过40字的台词转分镜会被硬拆，建议按句号拆成两句`);
       continue;
@@ -824,6 +859,100 @@ function listScriptFiles(d) {
     .map((name) => path.join(d, name))
     .sort((a, b) => (episodeNoOfFile(path.basename(a)) - episodeNoOfFile(path.basename(b))) || a.localeCompare(b));
 }
+// ---------- 集号 / 场次号（v2.33.0）----------
+// 2026-10-19 实例：GPT 把第 33 集的集头写成「第003集」（场次号却是 33-1、33-2），整部剧有两个「第003集」、没有第 033 集；
+// 客户端按集头认集，第 33 集的内容盖掉了真正的第 3 集，第 3 集整场丢失。以前 gate 只看逐行格式，集号对不对没人查。
+// 规范：每集一行集头「第NNN集 标题」（三位数补零），集号 = 这一集的集号；场次号「集号-序号」，序号从 1 连续。
+const EP_HEAD_RE = /^第\s*0*(\d+)\s*集[\s　]*(.*)$/;
+const SCENE_NO_RE = /^(\d+)-(\d+)(\s+\S.*)$/;
+const pad3 = (n) => String(n).padStart(3, '0');
+// 切成集块：每个集头起一块；没有集头的整段算一块(head = null)
+function splitEpisodeBlocks(lines) {
+  const blocks = [];
+  let cur = null;
+  lines.forEach((raw, i) => {
+    const l = raw.trim();
+    const head = l.match(EP_HEAD_RE);
+    if (head) { cur = { headLine: i, raw: l, number: Number(head[1]), title: head[2].replace(/^[：:\-—–·.、\s　]+/, '').trim(), scenes: [] }; blocks.push(cur); return; }
+    const scene = l.match(SCENE_NO_RE);
+    if (scene) {
+      if (!cur) { cur = { headLine: -1, raw: '', number: 0, title: '', scenes: [] }; blocks.push(cur); }
+      cur.scenes.push({ line: i, ep: Number(scene[1]), seq: Number(scene[2]), rest: scene[3] });
+    }
+  });
+  return blocks;
+}
+// expected: 这个文件应有的集号(单集文件 = 文件名 / save 的 --episode)；合并文件按第一集往后连续。返回硬伤清单。
+function checkNumbering(text, expected = 0) {
+  const lines = String(text || '').split(/\r?\n/);
+  const blocks = splitEpisodeBlocks(lines);
+  const errors = [];
+  if (!blocks.length) return errors;
+  const first = blocks.find((b) => b.number > 0);
+  const base = blocks.length === 1 && expected > 0 ? expected : (expected > 0 ? expected : (first ? first.number : 0));
+  const seen = new Map();
+  blocks.forEach((block, index) => {
+    const want = base > 0 ? base + index : block.number;
+    const where = block.headLine >= 0 ? `第${block.headLine + 1}行` : '开头';
+    if (block.headLine < 0) errors.push(`${where} 没有集头 → 第一行写「第${pad3(want || 1)}集 标题」`);
+    else {
+      if (want && block.number !== want) errors.push(`${where} 集头「${block.raw.slice(0, 24)}」集号是 ${block.number}，这一集应是第 ${want} 集 → 改成「第${pad3(want)}集 ${block.title}」（或跑 chenyu-pro renumber 自动改）`);
+      else if (!/^第\d{3,}集 \S/.test(block.raw)) errors.push(`${where} 集头写法不规范（${block.raw.slice(0, 24)}）→ 写成「第${pad3(block.number)}集 ${block.title || '标题'}」：三位数集号、空一格、集标题`);
+      if (seen.has(block.number)) errors.push(`${where} 集号 ${block.number} 和第${seen.get(block.number) + 1}行的集头重复 → 同一份剧本里每一集集号只能出现一次`);
+      seen.set(block.number, block.headLine);
+    }
+    const epNo = want || block.number;
+    block.scenes.forEach((scene, k) => {
+      if (epNo && scene.ep !== epNo) errors.push(`第${scene.line + 1}行 场次号「${scene.ep}-${scene.seq}」的集号 ${scene.ep} 和本集第 ${epNo} 集对不上 → 改成「${epNo}-${k + 1}」`);
+      else if (scene.seq !== k + 1) errors.push(`第${scene.line + 1}行 场次号「${scene.ep}-${scene.seq}」不连续（本集第 ${k + 1} 场）→ 场次序号从 1 起按出场顺序连续编：「${epNo}-${k + 1}」`);
+    });
+  });
+  return errors;
+}
+// 按规范改写集头和场次号(纯结构, 不动正文)；返回新文本和改动清单。start: 合并文件第一集的集号。
+function renumberText(text, start = 0) {
+  const nl = /\r\n/.test(String(text)) ? '\r\n' : '\n';
+  const lines = String(text || '').split(/\r?\n/);
+  const blocks = splitEpisodeBlocks(lines);
+  const changes = [];
+  const first = blocks.find((b) => b.number > 0);
+  const base = start > 0 ? start : (first ? first.number : 1);
+  blocks.forEach((block, index) => {
+    const epNo = base + index;
+    if (block.headLine >= 0) {
+      const next = `第${pad3(epNo)}集 ${block.title}`.trimEnd();
+      if (lines[block.headLine].trim() !== next) { changes.push(`第${block.headLine + 1}行 ${lines[block.headLine].trim().slice(0, 24)} → ${next}`); lines[block.headLine] = next; }
+    }
+    block.scenes.forEach((scene, k) => {
+      const next = `${epNo}-${k + 1}${scene.rest}`;
+      if (lines[scene.line].trim() !== next) { changes.push(`第${scene.line + 1}行 ${scene.ep}-${scene.seq} → ${epNo}-${k + 1}`); lines[scene.line] = next; }
+    });
+  });
+  return { text: lines.join(nl), changes };
+}
+// renumber 命令：--file 单集/合并文件（--episode N 指定这一集或合并文件第一集的集号，默认单集按文件名、合并按第一个集头）
+// 或 --dir 目录（每个文件按文件名里的集号）。改之前留一份 .bak。零积分、纯本地。
+async function cmdRenumber() {
+  const file = arg('file', '');
+  const dir = arg('dir', '');
+  const targets = file ? [path.resolve(file)] : dir ? listScriptFiles(path.resolve(dir)) : die('用法: chenyu-pro renumber --file 剧本.txt [--episode 起始集号]  或  chenyu-pro renumber --dir <剧本目录>');
+  let total = 0;
+  for (const t of targets) {
+    if (!fs.existsSync(t)) die('文件不存在: ' + t);
+    const text = fs.readFileSync(t, 'utf8');
+    const start = Number(arg('episode', '')) || episodeNoOfFile(path.basename(t)) || 0;
+    const { text: next, changes } = renumberText(text, start);
+    if (!changes.length) { console.log(`── ${path.basename(t)}  集号、场次号已规范`); continue; }
+    fs.writeFileSync(t + '.bak', text, 'utf8');
+    fs.writeFileSync(t, next, 'utf8');
+    total += changes.length;
+    console.log(`── ${path.basename(t)}  改了 ${changes.length} 处（原文件留在 ${path.basename(t)}.bak）`);
+    for (const c of changes.slice(0, 40)) console.log('  · ' + c);
+    if (changes.length > 40) console.log(`  … 另有 ${changes.length - 40} 处`);
+  }
+  console.log(total ? `✓ 共改 ${total} 处。形象表里如果引用了旧场次号，重新跑 assets-export；然后重跑 gate` : '✓ 都已规范，不用改');
+}
+
 function loadVariantTable(dir) {
   const explicit = arg('variants', '');
   const candidates = explicit ? [path.resolve(explicit)] : (dir ? fs.readdirSync(dir).filter((n) => /形象变体表/.test(n) && !/汇总/.test(n)).map((n) => path.join(dir, n)) : []);
@@ -902,6 +1031,15 @@ async function cmdGate() {
   if (tableFile) console.log(`（按形象变体表核对变体名：${path.basename(tableFile)}）`);
   const ctx = newVariantContext(table);
   let totalErr = 0, totalWarn = 0;
+  // 目录里两个文件是同一集(文件名集号重复)或中间缺集: 合并交付时会互相覆盖 / 少一集
+  if (dir) {
+    const nums = targets.map((t) => episodeNoOfFile(path.basename(t))).filter((n) => n > 0);
+    const dup = [...new Set(nums.filter((n, i) => nums.indexOf(n) !== i))];
+    const gaps = [];
+    if (nums.length) for (let n = Math.min(...nums); n <= Math.max(...nums); n += 1) if (!nums.includes(n)) gaps.push(n);
+    if (dup.length) { console.log(`  ✗ 有 ${dup.length} 集出现了两个文件：第 ${dup.join('、')} 集 → 每集只留一个文件`); totalErr += dup.length; }
+    if (gaps.length) { console.log(`  ✗ 集号不连续，缺第 ${gaps.slice(0, 30).join('、')} 集 → 补上缺的集，或确认文件名里的集号写对了`); totalErr += gaps.length; }
+  }
   for (const t of targets) {
     if (!fs.existsSync(t)) die('文件不存在: ' + t);
     ctx.episode = episodeNoOfFile(path.basename(t));
@@ -989,7 +1127,7 @@ async function cmdSave() {
     const content = fs.readFileSync(it.file, 'utf8');
     if (content.trim().length < 50) die(`正文太短(${it.file})——不像一集剧本`);
     if (!flag('skip-gate')) {
-      const g = gateOneScript(content);
+      const g = gateOneScript(content, { ...newVariantContext(), episode: it.ep });
       if (g.errors.length) {
         for (const e of g.errors) console.log('  ✗ ' + e);
         die(`${path.basename(it.file)} 未过格式门（${g.errors.length}处硬伤）——修完重跑，或 --skip-gate 强制入库`);
@@ -1470,9 +1608,47 @@ async function cmdVideoAnalyze() {
   if (arg('episodes', '') && (explicitEpisodes.length !== files.length || new Set(explicitEpisodes).size !== explicitEpisodes.length)) {
     die(`--episodes 要和 --video-file 一一对应：给了 ${files.length} 个视频、${explicitEpisodes.length} 个不重复的集号`);
   }
-  const parsedNumbers = explicitEpisodes.length ? explicitEpisodes : files.map((f) => episodeNumberFromName(f));
+  // --start N（v2.33.0）：这一批从第 N 集开始（一部剧分几批跑时用）。文件名里有集号就按它排先后，取不到就按 --video-file 的顺序。
+  const startAt = Number(arg('start', '')) || 0;
+  if (startAt > 0 && explicitEpisodes.length) die('--start 和 --episodes 只能用一个');
+  let parsedNumbers = explicitEpisodes.length ? explicitEpisodes : files.map((f) => episodeNumberFromName(f));
+  if (startAt > 0) {
+    const fromName = parsedNumbers.slice();
+    const order = files.map((_, i) => i);
+    if (fromName.every((n) => n > 0)) order.sort((a, b) => fromName[a] - fromName[b] || a - b);
+    const next = new Array(files.length);
+    order.forEach((fileIndex, k) => { next[fileIndex] = startAt + k; });
+    parsedNumbers = next;
+    console.log(`  集号按 --start ${startAt} 往后编：${files.map((f, i) => `${path.basename(f)}→第${parsedNumbers[i]}集`).slice(0, 8).join('，')}${files.length > 8 ? ' …' : ''}`);
+  }
   const useFileNumbers = files.length > 0 && parsedNumbers.every((n) => n > 0) && new Set(parsedNumbers).size === parsedNumbers.length;
   const existingMax = existingEpisodes.reduce((max, id) => Math.max(max, Number(String(id).replace(/\D/g, '')) || 0), 0);
+  // 一部剧分几批跑、每批文件名都从 1 开始（第二批又是 1–30）：追加到已有项目时，文件名集号全部和已分析的集撞上、
+  // 且正好是 1..k 连续 —— 那是这一批自己的序号，自动接在已有最后一集后面往下编（2026-10-19 用户：每批都是 1–30，得自己改）。
+  // 项目里有分析失败的集时不自动顺延（可能是来补那几集的），照旧要求写明集号。
+  if (target && !startAt && !explicitEpisodes.length && useFileNumbers && existingEpisodes.length && !flag('reanalyze')) {
+    const sorted = [...parsedNumbers].sort((a, b) => a - b);
+    const batchLocal = sorted.every((n, i) => n === i + 1);
+    const allTaken = parsedNumbers.every((n) => existingEpisodes.includes(episodeIdOf(n)));
+    if (batchLocal && allTaken && !failedEpisodes.length) {
+      parsedNumbers = parsedNumbers.map((n) => existingMax + n);
+      console.log(`  这一批文件名是 1–${sorted.length}，项目里第 1–${existingMax} 集已经分析过：接着往下编为第 ${existingMax + 1}–${existingMax + sorted.length} 集`);
+      console.log(`    ${files.map((f, i) => `${path.basename(f)}→第${parsedNumbers[i]}集`).slice(0, 8).join('，')}${files.length > 8 ? ' …' : ''}`);
+      console.log('    编得不对就加 --start <这一批第一集的集号> 或 --episodes 逐个写明后重跑（还没上传、没扣分）');
+    }
+  }
+  // 没写 --project、但已有同名的视频分析项目：多半是同一部剧的下一批，另建项目会又从第 1 集编起、人物也各认各的
+  if (!target && !flag('new-series') && files.length) {
+    const guessTitle = arg('title') || inferTitleFromDir(path.dirname(path.resolve(files[0])));
+    const key = (t) => String(t || '').replace(/[\s·_\-—()（）\[\]【】]|第?\d+\s*[-~—至到]\s*\d+\s*集?|\d+集反推|反推|上|下|前|后|批|部分/g, '');
+    const same = guessTitle ? ((await api('/api/projects')).projects || []).filter((p) => (p.mode || '') === 'video_reverse' && key(p.title) && key(p.title) === key(guessTitle)) : [];
+    if (same.length) {
+      const p = same[0];
+      die(`已经有同名的视频分析项目《${p.title}》（${String(p.id).slice(-8)}）。同一部剧的下一批要追加到同一个项目，集号会接着往下编：\n` +
+        `  chenyu-pro video-analyze --project ${String(p.id).slice(-8)} --video-file <这一批的视频> [--start <第一集的集号>] --yes\n` +
+        '  确实是另一部剧，加 --new-series 另建项目。本次没有上传、没有扣分。');
+    }
+  }
   // 追加到已有项目但集号取不到：以前会悄悄接在最后一集后面顺序编号——补失败集时就编错位置
   // （2026-10-04 实例：文件名「9月15日-2.mp4」，补第 2、3、5…集被编成 EP072–EP088）。有缺集/失败集时必须明确集号。
   if (target && files.length && !useFileNumbers) {
@@ -3596,6 +3772,7 @@ function cmdHelp() {
   chenyu-gate inspect <文件>                              判断是小说 / 剧本 / 客户端工程，该怎么处理
   【写剧本、洗稿】
   chenyu-gate gate --file 第001集.txt | --dir <目录>      格式检查，改到 GATE_PASS
+  chenyu-gate renumber --file 剧本.txt | --dir <目录>   集号、场次号按规范自动改正
   chenyu-gate variants --dir <目录>                       汇总每个人物的形象
   chenyu-gate rename --dir <目录> …                        按改名表精确换名
   chenyu-gate wash-check --dir <目录> --source <原稿目录>   洗稿检查：照抄、旧名残留
@@ -3627,6 +3804,7 @@ function cmdHelp() {
   chenyu-pro save --project <id片段> --dir <目录>          批量回传(文件名含 第N集 的 .txt/.md)
   chenyu-pro next --dir <剧本目录> [--source <分析稿目录>]   工作单：哪几集通过/要改/没写，现在该做哪几件事(用户说"继续"先跑它)
   chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词/形象标记)，改到 GATE_PASS
+  chenyu-pro renumber --file 剧本.txt [--episode N] | --dir <目录>  集头「第NNN集」和场次号按规范自动改正(留 .bak)
   chenyu-pro variants --dir <剧本目录> --source <分析稿目录>            对照资产整理时定的形象变体，查剧本有没有漏用(到 VARIANTS_PASS)
   chenyu-pro variants --dir <目录> [--out 文件]           从正文【形象】标记汇总形象变体表（每人几个变体、出现在哪几集哪几场）
   chenyu-pro status --project <id片段|剧名> [--watch]      查/盯进度
@@ -3675,7 +3853,7 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, renumber: cmdRenumber, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
