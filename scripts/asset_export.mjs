@@ -329,7 +329,7 @@ const PLACE_LIKE_NAME_RE = /^(前台|礼宾台?|吧台|柜台|收银台|服务�
 // 2026-10-04：一张表道具清单是空的（剧本没写【道具】行），导进客户端后道具 0 件；同一张表形象名全是服装名。
 // 导出时文件照写、只打了警告，Agent 就把它交了。现在不完整的表不叫「形象表.json」，交付命令也不收。
 // episodes = 剧本实际有的集号；requireDesign = 完整版要做场景/道具设计，免费版不做。返回缺项清单，空 = 完整。
-export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false, keep = {} } = {}) {
+export function lookTableCompleteness(table, { episodes = [], requireDesign = true, allowNoProps = false, allowNoAppearance = false, keep = {} } = {}) {
   const issues = [];
   const chars = table.characters || [];
   if (!chars.length) issues.push('没有任何角色形象：剧本每场要有【形象】行');
@@ -346,7 +346,7 @@ export function lookTableCompleteness(table, { episodes = [], requireDesign = tr
       if (l.styling && String(l.styling.description || '').trim()) styled += 1;
     }
   }
-  if (noAppearance.length) issues.push(`${noAppearance.length} 个形象没写外观：${noAppearance.slice(0, 8).join('、')}${noAppearance.length > 8 ? ' 等' : ''}`);
+  if (noAppearance.length && !allowNoAppearance) issues.push(`${noAppearance.length} 个形象没写外观：${noAppearance.slice(0, 8).join('、')}${noAppearance.length > 8 ? ' 等' : ''}`);
   if (clothingNames.length) issues.push(`${clothingNames.length} 个形象名是服装名，要改成身份或事件（剧本【形象】行里全剧统一替换）：${clothingNames.slice(0, 8).join('、')}${clothingNames.length > 8 ? ' 等' : ''}`);
   if (requireDesign && styled < looksTotal) issues.push(styled ? `形象设计只做了 ${styled}/${looksTotal} 个：没做的那些客户端会自己另起一套造型，和已做的不统一` : `形象设计还没做（0/${looksTotal}）：先 looks-prepare，再填「形象设计.json」`);
   const covered = new Set(Object.keys(table.scenes || {}).map((key) => Number(key)));

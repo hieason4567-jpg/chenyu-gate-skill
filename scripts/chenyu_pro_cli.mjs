@@ -2486,7 +2486,7 @@ function cmdDeliver() {
   let title = arg('title', '');
   if (!title && lookTableFile) { try { title = JSON.parse(fs.readFileSync(lookTableFile, 'utf8').replace(/^﻿/, '')).title || ''; } catch { /* 用目录名 */ } }
   if (!title) title = inferTitleFromDir(path.dirname(scriptDir)) || inferTitleFromDir(scriptDir) || '未命名项目';
-  const root = arg('out', '') ? path.resolve(arg('out')) : projectDir(title);
+  const root = arg('out', '') ? path.resolve(arg('out')) : (EDITION === 'gate' ? path.join(projectsRoot(), '交付', safeDirName(title)) : projectDir(title));
   const put = (from, ...to) => { const target = path.join(root, ...to); fs.mkdirSync(path.dirname(target), { recursive: true }); if (path.resolve(from) !== path.resolve(target)) fs.copyFileSync(from, target); return target; };
   const copyDir = (from, ...to) => { let n = 0; for (const entry of fs.readdirSync(from, { withFileTypes: true })) { const src = path.join(from, entry.name); if (entry.isDirectory()) n += copyDir(src, ...to, entry.name); else { put(src, ...to, entry.name); n += 1; } } return n; };
   const count = { 分集: 0, 资产: 0, 报告: 0, 分析稿: 0, 其他: 0 };
@@ -3291,7 +3291,48 @@ async function cmdAssetsExport() {
   }
   // 完整性：客户端只收这一张表，缺什么客户端里就缺什么。不完整的表不叫「形象表.json」，免得被当成成品交出去。
   const draftFile = path.join(path.dirname(lookFile), '形象表.未完成.json');
-  const incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: flag('no-props'), keep: readKeepNotes(path.dirname(lookFile)) });
+  // 免费版兜底（2026-10-22）：gate 没有形象设计流程，很多剧本不写【形象】行。
+  // 这里只按人物行/说话人补"常态"基础形象与场次映射，不写外观；客户端导入后由 AI 造型补。
+  if (EDITION === 'gate') {
+    const existing = new Set(lookTable.characters.map((c) => c.name));
+    let added = 0;
+    for (const [name, p] of assets.people) {
+      if (existing.has(name)) continue;
+      const eps = [...(p.eps || [])];
+      lookTable.characters.push({
+        name,
+        kind: 'human',
+        episodes: eps,
+        looks: [{ variant: '常态', tag: `[${name}-常态]`, main: true, reason: '', appearance: '', episodes: eps }],
+      });
+      added += 1;
+    }
+    lookTable.scenes ||= {};
+    for (const ep of episodes) {
+      const key = String(ep.n);
+      lookTable.scenes[key] ||= {};
+      let scene = '';
+      for (const raw of String(ep.text).split(/\r?\n/)) {
+        const l = raw.trim();
+        if (!l) continue;
+        if (/^\d+-\d+\s+/.test(l)) { scene = l.split(/\s+/)[0]; lookTable.scenes[key][scene] ||= {}; continue; }
+        if (!scene) continue;
+        const pm = l.match(/^人物[:：]\s*(.+)$/);
+        if (pm) {
+          pm[1].split(/[、,，]/).map((s) => s.replace(/（[^）]*）|\([^)]*\)/g, '').trim()).filter(Boolean)
+            .forEach((n) => { lookTable.scenes[key][scene][n] = lookTable.scenes[key][scene][n] || '常态'; });
+          continue;
+        }
+        const dm = l.match(/^([^\s：:△▲【\d][^：:]{0,9})[：:](.+)$/);
+        if (dm) {
+          const n = dm[1].replace(/（[^）]*）|\([^)]*\)/g, '').trim();
+          if (n && n.length <= 8) lookTable.scenes[key][scene][n] = lookTable.scenes[key][scene][n] || '常态';
+        }
+      }
+    }
+    if (added) console.log(`  免费版基础形象：${added} 个角色按「常态」补齐（无外观，客户端导入后由 AI 造型补）`);
+  }
+  let incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: EDITION === 'gate' || flag('no-props'), allowNoAppearance: EDITION === 'gate', keep: readKeepNotes(path.dirname(lookFile)) });
   if (EDITION !== 'gate' && washRedesignMode(dir)) {
     const redesign = washRedesignIssues(looks, lookTable, { keep: readKeepNotes(path.dirname(lookFile)), episodes });
     incomplete.push(...redesign.issues);
