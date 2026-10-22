@@ -20,6 +20,13 @@ import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleRev
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.35.0 2026-10-22  免费版形象表兜底：没有【形象】行时按人物行/说话人补「常态」基础形象与场次映射
+//                    （只补结构不写外观，客户端导入后由 AI 造型补）；免费版 deliver 默认输出到
+//                    文档/辰屿项目/交付/<剧名>，形象表与全集、分集同层。Pro 行为不变。
+// v2.34.0 2026-10-22  新增「分集粒度与拆集」：90 秒/集与 45–70 秒/集的两种粒度、按场次切、长场对话中间切、
+//                    拆完平衡单集长度（台词字数÷4.5 + 动作行×1.4 估时）、每集结尾钩子、拆完逐集过 gate。
+//                    新增「角色卡去重」：群体甲乙首领合成一张群像卡、非人角色只用一个名字、单集无台词背景人物不建卡。
+//                    补充：换目录做分集版本要复制 审核结论.json；场景 description 字数不足会 ASSET_DESIGN_FAIL。
 // v2.33.0 2026-10-19  集号 / 场次号规范：gate 和 save 查集头「第NNN集 标题」的集号 = 本集集号、场次号前缀 = 集号、序号从 1 连续，
 //                    合并文件里集号不重复不跳号，gate --dir 查文件名集号重复和缺集（实例：第 33 集集头写成第003集，客户端第 3 集被盖掉）。
 //                    新增 renumber：按规范自动改集头和场次号（留 .bak）。
@@ -222,7 +229,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.33.0';
+const VERSION = '2.35.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
