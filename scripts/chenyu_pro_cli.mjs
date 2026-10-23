@@ -15,11 +15,14 @@ import { DOSSIER_FILE, applyAssetMap, checkAssetMap, collectAssetEvidence, norma
 import { WASH_MAP_FILE, addressTable, applyRenames, checkWashMap, normalizeWashMap, washCheck } from './wash_check.mjs';
 import { REVIEW_FILE, THRESHOLDS, deliverCheck } from './deliver_check.mjs';
 import { PLACE_PROP_DESIGN_FILE, assetListJson, buildCatalogIndex, collectAssets, lookStylingTemplate, isClothingVariantName, lookTableCompleteness, lookTableIssues, lookTableJson, washRedesignIssues, mergeLookStylings, mergePlacePropDesigns, propBudget, propBudgetNote, placePropTemplate, propNameIssues, renderAssetList } from './asset_export.mjs';
+import { ASSET_SEMANTIC_REVIEW_FILE, ASSET_SEMANTIC_PENDING_FILE, semanticReviewTemplate, applyAssetSemanticReview, assetImageSemantics } from './asset_semantics.mjs';
 import { VARIANT_CANDIDATE_FILE, VARIANT_DECISION_FILE, buildCandidates, checkAgainstScript, decisionTemplate, nameResolver, renderCandidates, scanAppearanceSignals, strongSignals } from './variant_candidates.mjs';
 import { ROLE_DECISION_FILE, ROLE_REVIEW_FILE, isDescriptiveName, pendingRoleReviews, placeLikeRoleNames, renderRoleReview, roleDecisionTemplate, rolesNeedingReview } from './merge_review.mjs';
 import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
+// v2.35.1 2026-10-22  资产身份由Agent显式给出，场景关系绑定原文AI审核；群像多人差异化，避免平台单人模板。
+// v2.36.0 2026-10-23  情绪括注检查：关键台词括注不足 6 字、只写单字情绪、把动作写进括注、同场同角色同一括注第 3 次出现，都出警告。
 // v2.35.0 2026-10-22  免费版形象表兜底：没有【形象】行时按人物行/说话人补「常态」基础形象与场次映射
 //                    （只补结构不写外观，客户端导入后由 AI 造型补）；免费版 deliver 默认输出到
 //                    文档/辰屿项目/交付/<剧名>，形象表与全集、分集同层。Pro 行为不变。
@@ -229,7 +232,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.35.0';
+const VERSION = '2.36.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -759,6 +762,8 @@ function gateOneScript(text, ctx = newVariantContext()) {
   let inSceneIntro = false;  // 是否处在"场次头之后、首个△/台词之前"（环境描述行允许区）
   const actionSeen = new Map(); // △正文 → 出现行号（重复△检测）
   let sceneHead = null, sceneBuf = []; // 当前场景的△/画面文字（载具进出连续性检测）
+  let emotionCueCounts = new Map(); // 本场同一角色同一情绪括注的出现次数
+  let sceneDialogueSeen = false;    // 本场是否已经出现过第一句台词
   // 哑蒙太奇检测(2026-10-09 实拍暴露): 一串△之后才出现解说旁白 → 分镜照行序拍, 前面那串画面全程无人声。
   let actionRunLen = 0, actionRunStart = -1, narrationLed = false;
   const flushScene = () => {
@@ -796,8 +801,8 @@ function gateOneScript(text, ctx = newVariantContext()) {
     }
     // 人物行、画面/镜头描述块：合法结构行，放行不计叙述。
     if (isCharacterListLine(l) || isPictureLine(l)) { flushRun(); continue; }
-    if (isSceneHead(l)) { flushRun(); flushScene(); sceneHead = l; inSceneIntro = true; actionRunLen = 0; narrationLed = false; continue; }
-    if (isEpTitle(l)) { flushRun(); flushScene(); sceneHead = null; actionRunLen = 0; narrationLed = false; continue; }
+    if (isSceneHead(l)) { flushRun(); flushScene(); sceneHead = l; inSceneIntro = true; actionRunLen = 0; narrationLed = false; emotionCueCounts = new Map(); sceneDialogueSeen = false; continue; }
+    if (isEpTitle(l)) { flushRun(); flushScene(); sceneHead = null; actionRunLen = 0; narrationLed = false; emotionCueCounts = new Map(); sceneDialogueSeen = false; continue; }
     if (isMetaLine(l)) { flushRun(); sceneBuf.push(l.replace(/^【[^】]*】/, '')); continue; }
     if (isVariantLine(l)) { flushRun(); continue; }
     const d = matchDialogue(l);
@@ -816,6 +821,23 @@ function gateOneScript(text, ctx = newVariantContext()) {
         narrationLed = false;
       }
       actionRunLen = 0;
+      // 情绪括注（v2.36.0）：关键台词要写 6–18 字的神态+语气，不能只写「冷/怒/惊」；动作放 △，不写进括注。
+      if (!isNarrationDialogue(d)) {
+        const leadNote = (d.body.match(/^[（(][^）)]*[）)]/) || [''])[0];
+        const cueRaw = (d.note || leadNote || '').trim();
+        const cueBody = cueRaw.replace(/^[（(]|[）)]$/g, '').replace(/[（(][^）)]*[）)]/g, '').trim();
+        const keyLine = /[！？!?]/.test(d.body) || d.body.length > 12 || !sceneDialogueSeen;
+        sceneDialogueSeen = true;
+        if (keyLine && cueBody.length < 6) warnings.push(`第${ln}行 情绪括注太短（${cueBody || '没写'}）——关键台词写 6–18 字的神态+语气，如「（居高临下，声音冷得没有起伏）」`);
+        if (cueBody && /^(冷|怒|惊|怕|慌|急|笑|哭|恨|喜|悲|愣|怔|沉|淡|讽|嘲|惧|羞|恼)$/.test(cueBody)) warnings.push(`第${ln}行 情绪括注只有单字「${cueBody}」——补神态和语气，别只写一个情绪词`);
+        if (cueBody && /(转身|握拳|后退|低头|抬头|抬手|点头|摇头|起身|坐下|跪下|伸手)/.test(cueBody)) warnings.push(`第${ln}行 情绪括注里写了动作「${cueBody}」——动作放 △，括注只写怎么说`);
+        if (cueBody) {
+          const k = `${sceneHead || ''}|${d.speaker}|${cueBody}`;
+          const n = (emotionCueCounts.get(k) || 0) + 1;
+          emotionCueCounts.set(k, n);
+          if (n === 3) warnings.push(`第${ln}行 「${d.speaker}」在这场第 3 次用同一个情绪括注「${cueBody}」——换说法或改成动作`);
+        }
+      }
       run.push({ line: ln, speaker: d.speaker });
       if (d.body.length > 40) warnings.push(`第${ln}行 台词超长（${d.body.length}字）——超过40字的台词转分镜会被硬拆，建议按句号拆成两句`);
       continue;
@@ -2633,9 +2655,9 @@ function assetImageCandidates(table) {
     const prompt = String(l.styling?.description || l.design?.prompt || l.appearance || '').trim();
     if (!prompt) continue;
     const mainLook = (c.looks || []).find((x) => x.main === true) || (c.looks || [])[0];
-    items.push({ type: 'look', name: `${c.name}-${l.variant}`, owner: c.name, variant: l.variant, main: l === mainLook, mainRef: mainLook, prompt, ref: l, episodes: l.episodes || c.episodes || '' });
+    items.push({ type: 'look', name: `${c.name}-${l.variant}`, owner: c.name, kind: c.kind, memberScope: c.memberScope, identityEvidence: c.identityEvidence, variant: l.variant, main: l === mainLook, mainRef: mainLook, prompt, ref: l, episodes: l.episodes || c.episodes || '' });
   }
-  for (const p of table.places || []) if (String(p.description || '').trim()) items.push({ type: 'place', name: p.name, prompt: String(p.description).trim(), ref: p, episodes: p.episodes || '' });
+  for (const p of table.places || []) if (String(p.description || '').trim()) items.push({ type: 'place', name: p.name, prompt: String(p.description).trim(), ref: p, masterRef: p.physicalSpace && p.masterScene && p.masterScene !== p.name ? (table.places || []).find(x => x.name === p.masterScene && x.physicalSpace === p.physicalSpace) : null, episodes: p.episodes || '' });
   for (const p of table.props || []) if (p.card === true && String(p.description || '').trim()) items.push({ type: 'prop', name: p.name, prompt: String(p.description).trim(), ref: p, episodes: p.episodes || '' });
   items.forEach((item, index) => { item.no = index + 1; });
   return items;
@@ -2699,6 +2721,7 @@ async function cmdAssetImage() {
     try {
       // 变体要用主形象的图；主形象这一批里没出成就不出这张（不花分、不换脸）
       if (item.type === 'look' && !item.main && !item.mainRef?.image?.artifact_id) throw new Error('主形象这次没出成，这个变体先不出（各出各的会换脸）');
+      if (item.type === 'place' && item.masterRef && !item.masterRef.image?.artifact_id) console.log('  ⚠ 空间母版尚无可引用图片；本次仅文字空间约束，不能称为已验证结构一致，不自动追加母版付费生成');
       const res = await api(`/api/projects/${p.id}/assets/generate-image`, {
         method: 'POST', timeoutMs: 360000, retries: 0, softFail: true,
         body: {
@@ -2710,6 +2733,7 @@ async function cmdAssetImage() {
             : {}),
           ...(arg('style', '') ? { visual_style: arg('style') } : {}),
           prompt_template: 'client', // 和客户端资产卡同一套出图提示词（版式在知识库里）
+          ...assetImageSemantics(item),
           save_scope: 'project', source_text: ''
         }
       });
@@ -3106,13 +3130,14 @@ function writePlacePropTask(kitDir, root, table, episodes, kit) {
     '只有同时满足「外观必须前后一致」和「观众会注意到它」的 B 级道具（信物、证据原件、标志性随身物），才把 card 改成 true 并写 description；水杯、盘子、文件夹、普通手机这类一律不建卡。',
     '',
     '## 二、输出格式',
-    '场景：{"description":"80–180 个汉字的可搭建空间说明：布局、门窗墙地、固定家具、纵深；稀疏场景可做保守空间设计，不新增剧情实体","shortDescription":"4–18 字场景短标签","parentLocation":"所属物理地点（同一建筑/院落/机构/车辆填同一个名字，门口与室内同组但仍是不同场景）"}',
+    '场景：{"description":"80–180 个汉字的可搭建空间说明：布局、门窗墙地、固定家具、纵深；稀疏场景可做保守空间设计，不新增剧情实体","shortDescription":"4–18 字场景短标签","parentLocation":"建筑或机构风格组；不表示同一物理空间。物理空间、别名、局部与母版关系在资产关系审核.json由AI逐条确认"}',
     '道具：{"card":true 或 false,"reason":"不建卡时写原因","description":"建卡时 50–140 个汉字的实体外观说明：材质、颜色、形状、尺寸、磨损、独特标记","shortDescription":"建卡时 4–18 字道具短标签"}',
     '',
     '- 道具建卡：确有稳定外观、跨镜头/跨集要连续、或外观独特的才建（信物、证据原件、关键图纸、标志性随身物）；普通一次性纸张、单据、食物、屏幕内容不建卡（剧情照写，只是不出卡）。',
     '- 例外：人物在剧本里实际拿起、拨打、接听、挂断的手机/电话等通话设备，必须建卡。',
     '- 描述只写看得见的外观，按原剧本世界（年代、身份、贫富）设计；不写剧情、不写人物动作、不写“被打翻”这类状态（状态留在分镜里）。',
     '- 同一物理地点的子场景（如「程家·客厅」「程家·书房」）风格统一：parentLocation 相同，描述里的建筑年代、装修风格、主色保持一致。',
+    '- AI必须依据全剧逐场原文核对：同一实际空间的高台、高台前、门旁、台阶等首先视为区域或视角，只有剧情明确是不同空间才独立设计；不能按名字相似度自动合并，也不能因后缀不同自动拆卡。assets-export生成资产关系待审核.json后，逐条填写physicalSpace、canonicalName、masterScene、region、reason及原文sourceQuote，保存为资产关系审核.json再导出。完全同一场景的别名共享canonicalName；同一空间的独立局部卡可保留不同canonicalName，但physicalSpace与masterScene相同。',
   ].join('\n');
   fs.writeFileSync(path.join(kitDir, '场景道具设计任务.md'), task, 'utf8');
   const todo = tpl.filter((e) => (e.type === 'place' ? !String(e.design?.description || '').trim() : e.design?.card !== true && e.design?.card !== false)).length;
@@ -3168,7 +3193,8 @@ async function cmdLooksPrepare() {
     '## 六、输出格式（每条 styling 一个对象，和造型 AI 单条返回一致）',
     '{"classification":{"roleDomain":"身份领域","roleTags":["具体身份标签"]},"wardrobeCapsuleId":"形象库真实 id","description":"性别：…。年龄段：…。外观特征：…。脸部：…。身材：…。发型：…。服饰类型：…。发色：…。主色调：…。部件配色：…。视觉锚点：…。（≥120 中文字，按这个顺序）","voicePresetKey":"女-青年-明亮利落","voiceRefDescription":"≤4 个声学特点","ttsProvider":"Doubao","doubaoVoiceId":"候选里的确切 ID","doubaoVoiceModel":"' + st.doubaoDefaultModel + '","doubaoVoiceSpeed":1}',
     '',
-    '- 同一角色的各形象用同一个 voicePresetKey 和 doubaoVoiceId（回忆里不同年龄段的形象除外：幼年/少年换对应年龄的音色，否则客户端音色审核会打回重做）；群体角色写成一群人的统一装束；非人角色按物种外形写，音色按它的说话方式选（不说话的选最贴近的并在 voiceRefDescription 写明「不说话」）。',
+    '- 每条形象顶层明确 kind:human|group|creature；这是Agent看原文后的身份判断，不能靠名称关键词猜。群体还须在资产关系审核.json写 memberScope 与原文证据。群像必须多人同框，成员有不同脸、年龄、身形、发型与衣装细节；同宗门可统一标识与基调，不要求同款同色；普通人群各穿各的。不得套单人脸部特写加三视图。',
+    '- 同一角色的各形象用同一个 voicePresetKey 和 doubaoVoiceId（回忆里不同年龄段的形象除外）；非人角色按物种外形写，音色按说话方式选（不说话的在 voiceRefDescription 写明「不说话」）。',
     '- 身份、年龄、体貌、服装款式和状态以原片为准（input.appearanceFeatures 是原片外观锚点，不可改写）；主色调按第七节的全剧配色规划定。',
     '',
     '## 七、全剧配色规划（动笔填 styling 之前先做；和客户端的造型总监是同一套要求）',
@@ -3339,6 +3365,17 @@ async function cmdAssetsExport() {
     }
     if (added) console.log(`  免费版基础形象：${added} 个角色按「常态」补齐（无外观，客户端导入后由 AI 造型补）`);
   }
+  const relationFile = path.join(path.dirname(out), ASSET_SEMANTIC_REVIEW_FILE);
+  let relationReview;
+  try { if (fs.existsSync(relationFile)) relationReview = JSON.parse(fs.readFileSync(relationFile, 'utf8').replace(/^\uFEFF/, '')); }
+  catch { console.log('  ⚠ 资产关系审核读取失败，保留资产并交AI重新核对'); }
+  const relationTemplate = semanticReviewTemplate(lookTable, episodes);
+  const relationResult = applyAssetSemanticReview(lookTable, relationReview, episodes);
+  if (relationResult.applied) console.log('  ✓ ASSET_SEMANTICS_AI_CONFIRMED  AI身份和物理空间关系已应用');
+  else {
+    fs.writeFileSync(path.join(path.dirname(out), ASSET_SEMANTIC_PENDING_FILE), JSON.stringify(relationTemplate, null, 1), 'utf8');
+    console.log(`  ⚠ ASSET_SEMANTICS_PENDING  ${relationResult.warnings.join('；')}；Agent通读待审核文件 input，填 characters/places 的准确键、判断理由、原文 sourceQuote，存为${ASSET_SEMANTIC_REVIEW_FILE}后重跑。此诊断不阻断导出，LOOK_TABLE_PASS只表示原有结构检查通过。`);
+  }
   let incomplete = lookTableCompleteness(lookTable, { episodes: episodes.map((e) => e.n), requireDesign: EDITION !== 'gate', allowNoProps: EDITION === 'gate' || flag('no-props'), allowNoAppearance: EDITION === 'gate', keep: readKeepNotes(path.dirname(lookFile)) });
   if (EDITION !== 'gate' && washRedesignMode(dir)) {
     const redesign = washRedesignIssues(looks, lookTable, { keep: readKeepNotes(path.dirname(lookFile)), episodes });
@@ -3464,7 +3501,7 @@ async function cmdRemakeUnits() {
     const book = [
       `# 形象重设计任务（${chars.length} 个形象，填 ${rm.REMAKE_UNIT_DIR}/${rm.REMAKE_CHAR_FILE} 每条的 new）`, '',
       '洗稿重做形象的目标：和原片拉开辨识度——脸型、发型、主色调、配色都换；保留原形象的服装类别和状态（病号服仍是病号服、手术服仍是手术服、制服仍是制服）、年龄段、身份。',
-      '先整部剧一次规划：主要角色之间脸型、发型、主色调互相错开；同一个人（base 相同）的各形象脸、身材、发型、发色一致，只按状态换装，用同一个音色；群像写成一群人的统一装束和代表成员。',
+      '先整部剧一次规划：主要角色之间脸型、发型、主色调互相错开；同一个人（base 相同）的各形象脸、身材、发型、发色一致，只按状态换装，用同一个音色；群像必须多个不同成员同框，保留组织标识和基调，成员脸、年龄、身形、发型、服装细节有差异，不要求同款同色，不锁成一张代表主脸。',
       'old 是原造型，只作参考身份/状态，不要照抄它的脸、发型、配色。swapped=true 的是换了性别的角色。', '',
       '每条 new 填：',
       '- styleDescription：按 性别→年龄段→外观特征→脸部→身材→发型→服饰类型→发色→主色调→部件配色→视觉锚点 写，≥120 字，结尾可加「双手自然放松，仅展示稳定角色造型，不携带临时道具」。',
