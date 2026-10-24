@@ -22,6 +22,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
 // v2.35.1 2026-10-22  资产身份由Agent显式给出，场景关系绑定原文AI审核；群像多人差异化，避免平台单人模板。
+// v2.37.1 2026-10-24  形象换装原因可以用前面的换装△证明，不再强制在形象行写括号（与「形象行禁止括号」配套）。
 // v2.37.0 2026-10-24  形象行禁止括号：境界/伤势/威压/光效/换装原因写进△或台词，客户端会把括号内容当新形象标签
 //                    （实例：叶辰被拆成13张形象卡）。gate 对【形象】里的括号直接报硬伤。
 // v2.36.0 2026-10-23  情绪括注检查：关键台词括注不足 6 字、只写单字情绪、把动作写进括注、同场同角色同一括注第 3 次出现，都出警告。
@@ -234,7 +235,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.37.0';
+const VERSION = '2.37.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -712,7 +713,8 @@ function checkVariants(rawLines, ctx, errors, warnings) {
           if (midScene && scene.declared.has(e.name) && !scene.actionsSinceMark.some((a) => a.includes(e.name) && VARIANT_CHANGE_ACTION_RE.test(a))) {
             warnings.push(`第${ln}行 「${e.name}」同一场里从「${before}」变成「${e.variant}」，但前面没有换装的△——先写可见的换装动作`);
           }
-          if (!e.cause) warnings.push(`第${ln}行 「${e.name}」形象从「${before}」变成「${e.variant}」没注明原因——写成「${e.name}=${e.variant}（换装/受伤/时间跳跃等原因）」；如果其实没变，沿用「${before}」`);
+          const hasReasonAction = scene.actionsSinceMark.some((a) => a.includes(e.name) && VARIANT_CHANGE_ACTION_RE.test(a));
+          if (!e.cause && !hasReasonAction) warnings.push(`第${ln}行 「${e.name}」形象从「${before}」变成「${e.variant}」没注明原因——写成「${e.name}=${e.variant}（换装/受伤/时间跳跃等原因）」；如果其实没变，沿用「${before}」`);
         }
         if (ctx.table && !(ctx.table.get(e.name)?.has(e.variant))) {
           warnings.push(`第${ln}行 「${e.name}=${e.variant}」不在形象变体表里——变体名要和表里一字不差（防止同一形象多个叫法），或把新变体补进表`);
