@@ -22,6 +22,8 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
 // v2.35.1 2026-10-22  资产身份由Agent显式给出，场景关系绑定原文AI审核；群像多人差异化，避免平台单人模板。
+// v2.37.0 2026-10-24  形象行禁止括号：境界/伤势/威压/光效/换装原因写进△或台词，客户端会把括号内容当新形象标签
+//                    （实例：叶辰被拆成13张形象卡）。gate 对【形象】里的括号直接报硬伤。
 // v2.36.0 2026-10-23  情绪括注检查：关键台词括注不足 6 字、只写单字情绪、把动作写进括注、同场同角色同一括注第 3 次出现，都出警告。
 // v2.35.0 2026-10-22  免费版形象表兜底：没有【形象】行时按人物行/说话人补「常态」基础形象与场次映射
 //                    （只补结构不写外观，客户端导入后由 AI 造型补）；免费版 deliver 默认输出到
@@ -232,7 +234,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.36.0';
+const VERSION = '2.37.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -700,6 +702,7 @@ function checkVariants(rawLines, ctx, errors, warnings) {
     if (isActionLine(l)) { scene.actionsSinceMark.push(l); continue; }
     if (isVariantLine(l)) {
       marks++;
+      if (/[（(]/.test(l)) errors.push(`第${ln}行 形象行带了括号（${l.slice(0, 40)}）→ 【形象】只写「角色=变体名」，变体名≤8字、不含括号；境界/伤势/威压/光效/换装原因写进前面的△或台词，否则客户端会把括号内容当成新形象标签（实例：叶辰被拆成13张卡）`);
       const { entries, problems } = parseVariantLine(l);
       for (const pb of problems) errors.push(`第${ln}行 ${pb}`);
       const midScene = scene.hasMark;
