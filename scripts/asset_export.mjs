@@ -1,5 +1,6 @@
 // 全局资产清单（纯本地、零积分）：从剧本的 场次头 / 人物： / 【形象】 / 【道具】 行汇总全剧人物、形象、场景、道具，
 // 合并审核结论.json 里的外观描述，导出给下游建角色卡/场景图/道具图用。
+import { explicitAssetKind } from './asset_semantics.mjs';
 const epTag = (n) => `第${String(n).padStart(3, '0')}集`;
 const span = (set) => {
   const a = [...set].sort((x, y) => x - y);
@@ -19,10 +20,13 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
   const people = new Map(); // 名 -> { eps:Set, lines, looks: Map(变体 -> { eps:Set, appearance }) }
   const scenes = new Map(); // 场景名 -> { eps:Set, times:Set }
   const casting = new Map(); // 集 -> Map(场次号 -> { 角色: 变体 })，客户端按场绑定 [角色-变体名]
+  const scenePlaces = {};
   let sceneNo = '';
   const props = new Map(); // 道具名 -> { eps:Set, owners:Set, states:Set, counts:Set }
   const person = (name) => { if (!people.has(name)) people.set(name, { eps: new Set(), lines: 0, looks: new Map() }); return people.get(name); };
   const lookText = new Map(looks.map((x) => [`${String(x.role || '').trim()}=${String(x.variant || '').trim()}`, String(x.appearance || '')]));
+  const roleKinds = new Map();
+  for (const look of looks) if (explicitAssetKind(look?.kind)) roleKinds.set(String(look.role || '').trim(), look.kind);
   for (const { n, text } of episodes) {
     for (const raw of String(text).replace(/\r\n/g, '\n').split('\n')) {
       const l = raw.trim();
@@ -30,6 +34,7 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
       if (head && /^\d+-\d+\s/.test(l)) {
         sceneNo = l.match(/^(\d+-\d+)/)[1];
         const name = head[3].trim();
+        scenePlaces[sceneNo] = name;
         if (!scenes.has(name)) scenes.set(name, { eps: new Set(), times: new Set() });
         scenes.get(name).eps.add(n);
         if (head[1] || head[2]) scenes.get(name).times.add(`${head[1] || ''}${head[2] || ''}`);
@@ -37,15 +42,25 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
       }
       if (/^人物[:：]/.test(l)) { for (const p of splitList(l.slice(3))) person(p).eps.add(n); continue; }
       if (l.startsWith('【形象】')) {
-        for (const kv of l.slice(4).split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/)) { // 和格式门 parseVariantLine 同一套写法
-          const m = kv.match(/^\s*([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(]([^）)]*)[）)])?\s*$/);
-          if (!m) continue;
-          const who = m[1].trim(), v = m[2].trim();
+        const body = l.slice(4).trim();
+        const tags = [...body.matchAll(/\[([^\[\]]+)\]/g)].map((m) => m[1]);
+        const pairs = [];
+        if (tags.length) {
+          // 客户端标签格式：[角色-变体名]
+          for (const tag of tags) { const i = tag.indexOf('-'); if (i > 0) pairs.push([tag.slice(0, i), tag.slice(i + 1), '']); }
+        } else {
+          // 旧格式兼容：角色=变体名；角色=变体名（原因）
+          for (const kv of body.split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/)) {
+            const m = kv.match(/^\s*([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(]([^）)]*)[）)])?\s*$/);
+            if (m) pairs.push([m[1].trim(), m[2].trim(), (m[3] || '').trim()]);
+          }
+        }
+        for (const [who, v, cause] of pairs) {
           const p = person(who); p.eps.add(n);
           if (!p.looks.has(v)) p.looks.set(v, { eps: new Set(), scenes: 0, reason: '', appearance: lookText.get(`${who}=${v}`) || '' });
           const lk = p.looks.get(v);
           lk.eps.add(n); lk.scenes++;
-          if (!lk.reason && m[3]) lk.reason = m[3].trim();
+          if (!lk.reason && cause) lk.reason = cause;
           if (sceneNo) {
             if (!casting.has(n)) casting.set(n, new Map());
             const byScene = casting.get(n);
@@ -75,17 +90,17 @@ export function collectAssets(episodes, { looks = [], creatures = [] } = {}) {
     }
   }
   const creatureSet = new Set(creatures);
-  return { people, scenes, props, creatureSet, casting };
+  return { people, scenes, props, creatureSet, casting, roleKinds, scenePlaces };
 }
 
-export function renderAssetList({ people, scenes, props, creatureSet }, { title = '' } = {}) {
+export function renderAssetList({ people, scenes, props, creatureSet, roleKinds = new Map() }, { title = '' } = {}) {
   const rows = [];
   rows.push(`# ${title ? title + ' · ' : ''}全局资产清单`, '');
   rows.push(`人物 ${people.size} 个（其中非人角色 ${[...people.keys()].filter((k) => creatureSet.has(k)).length} 个）｜形象 ${[...people.values()].reduce((s, p) => s + p.looks.size, 0)} 个｜场景 ${scenes.size} 个｜道具 ${props.size} 件`, '');
   rows.push('## 一、人物与形象', '', '| 人物 | 类型 | 出场集 | 台词句数 | 形象（变体名） | 外观 | 该形象出现集 |', '| --- | --- | --- | --- | --- | --- | --- |');
   const ordered = [...people.entries()].sort((a, b) => (b[1].lines - a[1].lines) || (Math.min(...a[1].eps) - Math.min(...b[1].eps)));
   for (const [name, p] of ordered) {
-    const kind = creatureSet.has(name) ? '非人角色' : /数人|若干|\d+名|[二两三四五六七八九十]名/.test(name) ? '群体' : '人物';
+    const kind = roleKinds.get(name) === 'group' ? '群体角色' : roleKinds.get(name) === 'human' ? '人物' : creatureSet.has(name) || roleKinds.get(name) === 'creature' ? '非人角色' : '角色（具体类型见AI关系审核）';
     const looks = [...p.looks.entries()];
     if (!looks.length) rows.push(`| ${name} | ${kind} | ${span(p.eps)} | ${p.lines} | - | - | - |`);
     looks.forEach(([v, lk], i) => rows.push(`| ${i ? '' : name} | ${i ? '' : kind} | ${i ? '' : span(p.eps)} | ${i ? '' : p.lines} | ${v} | ${lk.appearance || '（待补外观）'} | ${span(lk.eps)} |`));
@@ -111,14 +126,13 @@ export function propNameIssues({ props }) {
   return issues;
 }
 
-export function assetListJson({ people, scenes, props, creatureSet }) {
+export function assetListJson({ people, scenes, props, creatureSet, roleKinds = new Map() }) {
   return {
-    characters: [...people.entries()].map(([name, p]) => ({ name, creature: creatureSet.has(name), episodes: [...p.eps].sort((a, b) => a - b), dialogue_lines: p.lines, looks: [...p.looks.entries()].map(([variant, lk]) => ({ tag: `[${name}-${variant}]`, variant, appearance: lk.appearance, episodes: [...lk.eps].sort((a, b) => a - b) })) })),
+    characters: [...people.entries()].map(([name, p]) => ({ name, kind: explicitAssetKind(roleKinds.get(name)) || (creatureSet.has(name) ? 'creature' : null), creature: creatureSet.has(name), episodes: [...p.eps].sort((a, b) => a - b), dialogue_lines: p.lines, looks: [...p.looks.entries()].map(([variant, lk]) => ({ tag: `[${name}-${variant}]`, variant, appearance: lk.appearance, episodes: [...lk.eps].sort((a, b) => a - b) })) })),
     scenes: [...scenes.entries()].map(([name, s]) => ({ name, times: [...s.times], episodes: [...s.eps].sort((a, b) => a - b) })),
     props: [...props.entries()].map(([name, pr]) => ({ name, owners: [...pr.owners], states: [...pr.states], counts: [...pr.counts], episodes: [...pr.eps].sort((a, b) => a - b) }))
   };
 }
-const GROUP_RE = /数人|若干|\d+名|[二两三四五六七八九十]名|们$|群$|人群|群众|观众$|民众$|围观[一-龥]{1,3}$|一群|一众|众人|(?<![观听公大民受])众[一-龥]{1,3}$/;
 // 设计稿的分段标记：原文特征里出现三个以上，说明把设计稿抄进去了
 const DESIGN_SEGMENT_MARKERS = ['脸部：', '身材：', '服饰类型：', '主色调：', '部件配色：', '视觉锚点：'];
 export const looksLikeDesignText = (text) => DESIGN_SEGMENT_MARKERS.filter((m) => String(text || '').includes(m)).length >= 3;
@@ -177,12 +191,10 @@ const episodeCountOf = (span) => String(span || '').split(/[、,，]/).reduce((s
 }, 0);
 // 建卡原因里承认「它和另一件道具是同一样东西」的说法
 const SAME_ENTITY_RE = /同一(?:实体|件|台|个|把|辆|本|机)|为同[一场]|沿用.{0,12}外观|复用|后续称谓|另一(?:种)?(?:称谓|叫法)/;
-const CREATURE_RE = /蛊|虫|蛾|蟾|蛙|螳螂|蜂|蛛|蝶|鸭|鹅|鸵鸟|鸟|兽|蛇|狐|猫|狗|犬|兔|龟|鼠|狼|熊/;
-const HUMAN_LOOK_RE = /男|女|老人|老者|孩|西装|衬衫|外套|大衣|长袍|裙|裤|头发|盘发|短发|长发|辫/;
 
 // 形象表（给客户端「上传形象表」用）：有这张表时客户端按表建角色形象卡、按场绑定 [角色-变体名]，不再让 AI 猜变体。
 // main = 场次最多的那个形象；reason 取【形象】括号里第一次写的原因（伪装/回忆/受伤…）；scenes 按 集 -> 场次号 -> 角色=变体。
-export function lookTableJson({ people, creatureSet, casting, scenes: places = new Map(), props = new Map() }, { title = '' } = {}) {
+export function lookTableJson({ people, creatureSet, casting, scenes: places = new Map(), props = new Map(), roleKinds = new Map(), scenePlaces = {} }, { title = '' } = {}) {
   const characters = [];
   for (const [name, p] of people) {
     const looks = [...p.looks.entries()];
@@ -190,7 +202,9 @@ export function lookTableJson({ people, creatureSet, casting, scenes: places = n
     const main = looks.reduce((a, b) => (b[1].scenes > a[1].scenes ? b : a))[0];
     characters.push({
       name,
-      kind: creatureSet.has(name) || CREATURE_RE.test(name + (p.looks.get(main)?.appearance || '')) && !HUMAN_LOOK_RE.test(p.looks.get(main)?.appearance || '') ? 'creature' : GROUP_RE.test(name) ? 'group' : 'human',
+      // Old clients require a kind value. The compatibility fallback is explicitly unreviewed.
+      kind: explicitAssetKind(roleKinds.get(name)) || (creatureSet.has(name) ? 'creature' : 'human'),
+      kindSource: roleKinds.has(name) || creatureSet.has(name) ? 'agent' : 'unreviewed',
       episodes: span(p.eps),
       lines: p.lines || 0, // 全剧台词句数：用来判断是不是只露一面的龙套（客户端不读这个字段）
       looks: looks.map(([variant, lk]) => ({ variant, tag: `[${name}-${variant}]`, main: variant === main, reason: variant === main ? '' : lk.reason, appearance: lk.appearance, episodes: span(lk.eps) }))
@@ -208,7 +222,7 @@ export function lookTableJson({ people, creatureSet, casting, scenes: places = n
   const tiers = propTiers(props, allEpisodes.size);
   const propList = [...props.entries()].sort((a, b) => Math.min(...a[1].eps) - Math.min(...b[1].eps))
     .map(([name, pr]) => ({ name, tier: tiers.get(name), key: tiers.get(name) === 'A', owners: [...pr.owners], counts: [...pr.counts], states: [...pr.states].slice(0, 6), episodes: span(pr.eps) }));
-  return { schema: 'chenyu.look-table/v1', title, characters, scenes, places: placeList, props: propList };
+  return { schema: 'chenyu.look-table/v1', title, characters, scenes, scenePlaces, places: placeList, props: propList };
 }
 
 // 道具分级（2026-10-04）：以前剧本【道具】行里写过的每样东西都进表、都要设计建卡——54 集出过 200 件道具，
@@ -478,7 +492,7 @@ export function lookStylingTemplate(table, existing = [], inputs = new Map()) {
   for (const c of table.characters) for (const l of c.looks) {
     const key = `${c.name}=${l.variant}`;
     const old = prev.get(key);
-    out.push({ role: c.name, variant: l.variant, characterName: `[${c.name}-${l.variant}]`, kind: c.kind, main: l.main, reason: l.reason, episodes: l.episodes,
+    out.push({ role: c.name, variant: l.variant, characterName: `[${c.name}-${l.variant}]`, kind: explicitAssetKind(old?.kind) || (c.kindSource === 'agent' ? c.kind : null), main: l.main, reason: l.reason, episodes: l.episodes,
       input: inputs.get(key) || { appearanceFeatures: l.appearance || '' },
       styling: { ...emptyStyling(), ...(old?.styling || {}) } });
   }
@@ -520,6 +534,7 @@ export function mergeLookStylings(table, entries = [], opts = {}) {
   const issues = [];
   for (const c of table.characters) for (const l of c.looks) {
     const e = byKey.get(`${c.name}=${l.variant}`);
+    if (explicitAssetKind(e?.kind)) { c.kind = e.kind; c.kindSource = 'agent'; }
     if (!e || !String(e.styling?.description || '').trim()) { issues.push(`[${c.name}-${l.variant}] 还没有形象设计`); continue; }
     const problems = stylingIssues(e, { ...opts, gender: e.input?.gender || '' });
     for (const x of problems) issues.push(`[${c.name}-${l.variant}] ${x}`);

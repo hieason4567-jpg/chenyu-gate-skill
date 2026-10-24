@@ -22,6 +22,8 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
 // v2.35.1 2026-10-22  资产身份由Agent显式给出，场景关系绑定原文AI审核；群像多人差异化，避免平台单人模板。
+// v2.38.0 2026-10-24  形象行改用客户端标签格式【形象】[角色-变体名]、[角色-变体名]，不再用「角色=变体名」；
+//                    gate / looks-prepare / asset-export 同时兼容旧写法；变体名≤8字、不含 - 和括号。
 // v2.37.1 2026-10-24  形象换装原因可以用前面的换装△证明，不再强制在形象行写括号（与「形象行禁止括号」配套）。
 // v2.37.0 2026-10-24  形象行禁止括号：境界/伤势/威压/光效/换装原因写进△或台词，客户端会把括号内容当新形象标签
 //                    （实例：叶辰被拆成13张形象卡）。gate 对【形象】里的括号直接报硬伤。
@@ -235,7 +237,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.37.1';
+const VERSION = '2.38.0';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -614,7 +616,7 @@ const matchDialogue = (l) => {
 };
 
 // ---------- 形象变体（v2.6.0）----------
-// 每场开头一行「【形象】角色=变体名；角色=变体名」，场内换装在换装△后再写一行；形象跟上一场不同时括号注明原因：
+// 每场开头一行「【形象】[角色-变体名]、[角色-变体名]」，场内换装在换装△后再写一行；形象跟上一场不同时括号注明原因：
 //   【形象】苏燃=外出便装（回房换上外套）
 // 变体名必须具体（下游客户端建卡用 [角色-变体名] 标签，拒收"主形象/日常/默认"这类泛称）。
 // 规则来自出片事故：瞬时状态（淋湿/衣服被扯乱）不是变体；围裙/首饰/眼镜这类叠加小件记道具不建变体；
@@ -636,15 +638,29 @@ function parseVariantLine(l) {
   const entries = [], problems = [];
   const body = l.replace(/^【形象】\s*/, '').trim();
   if (!body) { problems.push('【形象】后面是空的'); return { entries, problems }; }
-  // 多人之间用 ；分隔，也容忍 ，、——只在后面紧跟「名字=」时才当分隔符，原因括号里的逗号不受影响
-  for (const raw of body.split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/).map((x) => x.trim()).filter(Boolean)) {
-    const m = raw.match(/^([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(]([^）)]*)[）)])?$/);
-    if (!m) { problems.push(`「${raw}」写法不对，应为「角色=变体名」或「角色=变体名（变化原因）」，多人用；分隔`); continue; }
-    const [, name, variant, cause] = m.map((x) => (x || '').trim());
-    if (VARIANT_PLACEHOLDER_RE.test(variant)) problems.push(`「${name}=${variant}」变体名太笼统——写具体外观（如 居家睡衣/黑色厨师服/额头包扎），下游建卡拒收"主形象/日常/默认"`);
-    else if (/[-－—\[\]【】]/.test(variant)) problems.push(`「${name}=${variant}」变体名里不要有 - 或括号（下游标签是 [角色-变体名]）`);
-    else if (variant.length > 10) problems.push(`「${name}=${variant}」变体名超过10字——变体名要短，外观细节写进形象变体表`);
-    entries.push({ name, variant, cause });
+  const add = (name, variant, cause = '') => {
+    name = String(name || '').trim(); variant = String(variant || '').trim();
+    if (!name || !variant) { problems.push(`「[${name || '?'}-${variant || '?'}]」写法不对，应为「[角色-变体名]」`); return; }
+    if (VARIANT_PLACEHOLDER_RE.test(variant)) problems.push(`「[${name}-${variant}]」变体名太笼统——写具体外观（如 居家睡衣/黑色厨师服/额头包扎），下游建卡拒收这种泛称`);
+    else if (/[-－—\[\]【】]/.test(variant)) problems.push(`「[${name}-${variant}]」变体名里不要有 - 或括号（客户端标签就是 [角色-变体名]）`);
+    else if (variant.length > 8) problems.push(`「[${name}-${variant}]」变体名超过8字——变体名要短，外观细节写进形象变体表`);
+    entries.push({ name, variant, cause: String(cause || '').trim() });
+  };
+  // 新格式（和客户端一致）：【形象】[叶辰-弟子]、[苏清月-内门第一天骄]
+  const tags = [...body.matchAll(/\[([^\[\]]+)\]/g)].map((m) => m[1]);
+  if (tags.length) {
+    for (const tag of tags) {
+      const i = tag.indexOf('-');
+      if (i <= 0 || i >= tag.length - 1) { problems.push(`「[${tag}]」不是客户端标签格式，应为「[角色-变体名]」`); continue; }
+      add(tag.slice(0, i), tag.slice(i + 1));
+    }
+  } else {
+    // 旧格式兼容：角色=变体名；角色=变体名（原因）
+    for (const raw of body.split(/[；;，,、](?=[^=＝:：（(；;，,、）)]{1,12}[=＝:：])/).map((x) => x.trim()).filter(Boolean)) {
+      const m = raw.match(/^([^=＝:：（(]+?)\s*[=＝:：]\s*([^（(]+?)\s*(?:[（(]([^）)]*)[）)])?$/);
+      if (!m) { problems.push(`「${raw}」写法不对，应为「[角色-变体名]」，多人用、分隔`); continue; }
+      add(m[1], m[2], m[3]);
+    }
   }
   const seen = new Map();
   for (const e of entries) {
@@ -703,7 +719,7 @@ function checkVariants(rawLines, ctx, errors, warnings) {
     if (isActionLine(l)) { scene.actionsSinceMark.push(l); continue; }
     if (isVariantLine(l)) {
       marks++;
-      if (/[（(]/.test(l)) errors.push(`第${ln}行 形象行带了括号（${l.slice(0, 40)}）→ 【形象】只写「角色=变体名」，变体名≤8字、不含括号；境界/伤势/威压/光效/换装原因写进前面的△或台词，否则客户端会把括号内容当成新形象标签（实例：叶辰被拆成13张卡）`);
+      if (/[（(]/.test(l)) errors.push(`第${ln}行 形象行带了括号（${l.slice(0, 40)}）→ 【形象】只写客户端标签「[角色-变体名]」，变体名≤8字、不含括号；境界/伤势/威压/光效/换装原因写进前面的△或台词，否则客户端会把括号内容当成新形象标签（实例：叶辰被拆成13张卡）`);
       const { entries, problems } = parseVariantLine(l);
       for (const pb of problems) errors.push(`第${ln}行 ${pb}`);
       const midScene = scene.hasMark;
