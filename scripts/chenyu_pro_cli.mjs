@@ -23,6 +23,9 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 // 版本号：功能变化 minor+1，修 bug patch+1。改动同时更新下方 CHANGELOG（最新的写在最上面）。
 // v2.35.1 2026-10-22  资产身份由Agent显式给出，场景关系绑定原文AI审核；群像多人差异化，避免平台单人模板。
 // v2.38.0 2026-10-24  形象行改用客户端标签格式【形象】[角色-变体名]、[角色-变体名]，不再用「角色=变体名」；
+// v2.38.1 2026-10-26  新增 ai-smell / plot-check / pace-check 三门；plot-check 查兜底形象标签、近义变体重复；pace-check 按 SOP 台词字数/4.5+动作×1.4 估时。
+// v2.38.3 2026-10-26  pace-fix 扩到三档：>105压到105、90-105压到90、纯环境空镜≥5行的短集再压10秒（下限75）；只删连续空镜/环境行/兜底反应动作，不动台词。
+// v2.38.4 2026-11-03  新增 gender-check：性转/男女互换洗稿的确定性门（角色性别映射 + 场景称呼 + 指代反向词），GENDER_PASS 才交付。
 //                    gate / looks-prepare / asset-export 同时兼容旧写法；变体名≤8字、不含 - 和括号。
 // v2.37.1 2026-10-24  形象换装原因可以用前面的换装△证明，不再强制在形象行写括号（与「形象行禁止括号」配套）。
 // v2.37.0 2026-10-24  形象行禁止括号：境界/伤势/威压/光效/换装原因写进△或台词，客户端会把括号内容当新形象标签
@@ -237,7 +240,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.38.0';
+const VERSION = '2.38.4';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -287,7 +290,7 @@ const args = process.argv.slice(2);
 const EDITION = process.env.CHENYU_EDITION === 'gate' ? 'gate' : 'pro';
 // 免费版老用法「chenyu-gate --file 剧本.txt / --dir 目录」= 格式门
 const cmd = EDITION === 'gate' && /^--(file|dir)$/.test(args[0] || '') ? 'gate' : (args[0] || 'help');
-const GATE_COMMANDS = new Set(['gate', 'renumber', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations',
+const GATE_COMMANDS = new Set(['gate', 'renumber', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations', 'ai-smell', 'plot-check', 'pace-check', 'pace-fix', 'gender-check',
   'remake-prepare', 'remake-units', 'remake-lint', 'remake-review', 'remake-apply', 'guide', 'help', 'version', '--version', '-v']);
 const CLI_NAME = EDITION === 'gate' ? 'chenyu-gate' : 'chenyu-pro';
 if (EDITION === 'gate') {
@@ -3878,6 +3881,11 @@ function cmdHelp() {
   chenyu-gate inspect <文件>                              判断是小说 / 剧本 / 客户端工程，该怎么处理
   【写剧本、洗稿】
   chenyu-gate gate --file 第001集.txt | --dir <目录>      格式检查，改到 GATE_PASS
+  chenyu-gate ai-smell --file 第001集.txt | --dir <目录>  去 AI 味门，改到 AI_SMELL_PASS
+  chenyu-gate plot-check --file 第001集.txt | --dir <目录> 剧情一致性门，改到 PLOT_PASS
+  chenyu-gate pace-check --file 第001集.txt | --dir <目录> 节奏门，改到 PACE_PASS
+  chenyu-gate pace-fix --file 第001集.txt | --dir <目录> [--dry-run] 只压空镜头/环境行，不动台词
+  chenyu-gate gender-check --file 剧本.txt --map 性别映射.json 性转洗稿校验，到 GENDER_PASS
   chenyu-gate renumber --file 剧本.txt | --dir <目录>   集号、场次号按规范自动改正
   chenyu-gate variants --dir <目录>                       汇总每个人物的形象
   chenyu-gate rename --dir <目录> …                        按改名表精确换名
@@ -3910,6 +3918,11 @@ function cmdHelp() {
   chenyu-pro save --project <id片段> --dir <目录>          批量回传(文件名含 第N集 的 .txt/.md)
   chenyu-pro next --dir <剧本目录> [--source <分析稿目录>]   工作单：哪几集通过/要改/没写，现在该做哪几件事(用户说"继续"先跑它)
   chenyu-pro gate --file 剧本.txt | --dir <目录>           格式门：确定性质量校验(对白连发/心理活动/超长台词/形象标记)，改到 GATE_PASS
+  chenyu-pro ai-smell --file 剧本.txt | --dir <目录>       去 AI 味门：违禁腔、重复括注、总结式台词，到 AI_SMELL_PASS
+  chenyu-pro plot-check --file 剧本.txt | --dir <目录>     剧情一致性门：说话人、道具持有人、重复△、形象标签，到 PLOT_PASS
+  chenyu-pro pace-check --file 剧本.txt | --dir <目录>     节奏门：SOP 估时、付费卡点，到 PACE_PASS
+  chenyu-pro pace-fix --file 剧本.txt | --dir <目录> [--dry-run] 只压空镜头/环境行，不动台词
+  chenyu-pro gender-check --file 剧本.txt --map 性别映射.json [--allow 允许清单.json] 性转洗稿校验
   chenyu-pro renumber --file 剧本.txt [--episode N] | --dir <目录>  集头「第NNN集」和场次号按规范自动改正(留 .bak)
   chenyu-pro variants --dir <剧本目录> --source <分析稿目录>            对照资产整理时定的形象变体，查剧本有没有漏用(到 VARIANTS_PASS)
   chenyu-pro variants --dir <目录> [--out 文件]           从正文【形象】标记汇总形象变体表（每人几个变体、出现在哪几集哪几场）
@@ -3959,7 +3972,336 @@ function cmdHelp() {
   升级: irm https://raw.githubusercontent.com/hieason4567-jpg/chenyu-pro-skill/main/install.ps1 | iex`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, renumber: cmdRenumber, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+
+// ---------- 本地质量门：ai-smell / plot-check / pace-check（v2.38.1） ----------
+function checkTargetFiles(cmdName, usage) {
+  const file = arg('file', '');
+  const dir = arg('dir', '');
+  const targets = [];
+  if (file) targets.push(path.resolve(file));
+  else if (dir) {
+    const d = path.resolve(dir);
+    if (!fs.existsSync(d)) die('目录不存在: ' + d);
+    targets.push(...listScriptFiles(d));
+    if (!targets.length) die('目录里没有 .txt/.md 剧本文件');
+  } else die('用法: chenyu-pro ' + cmdName + ' ' + usage);
+  return targets;
+}
+
+function parseCheckScript(text) {
+  const lines = String(text || '').replace(/\r\n/g, '\n').split('\n');
+  const scenes = [];
+  let cur = null;
+  lines.forEach((line, i) => {
+    if (/^\d+-\d+\s/.test(line)) {
+      cur = { head: line, people: [], props: [], dialogue: [], actions: [], img: [], line: i + 1 };
+      scenes.push(cur);
+      return;
+    }
+    if (!cur) {
+      cur = { head: '(开头)', people: [], props: [], dialogue: [], actions: [], img: [], line: i + 1 };
+      scenes.push(cur);
+    }
+    if (line.startsWith('人物：')) {
+      cur.people = line.slice(3).split(/[、，,]/).map((x) => x.trim()).filter(Boolean);
+    } else if (line.startsWith('【形象】')) {
+      cur.img = [...line.matchAll(/\[([^\-\]]+)-([^\]]+)\]/g)].map((m) => ({ base: m[1].trim(), variant: m[2].trim() }));
+    } else if (line.startsWith('【道具】')) {
+      cur.props = [...line.matchAll(/（([^；）]+)；/g)].map((m) => m[1].trim());
+    } else if (/^△/.test(line)) {
+      cur.actions.push({ line, lineNo: i + 1 });
+    } else {
+      const m = line.match(/^([^：△【\s]{1,12})[：:]/);
+      if (m) cur.dialogue.push({ who: m[1].trim(), line, lineNo: i + 1 });
+    }
+  });
+  return { lines, scenes };
+}
+
+function isLocationHolder(h) {
+  return /(里|上|下|外|中|边|间|面|前|后|底|口|台|床|桌|墙|院|舱|船|桶|筐|盒|匣|锅|灶|手|怀|袖|头|脚|地|海|岸|门|窗|房|棚|窖|庙|仓|滩|礁|田|柜|枕|箱|袋|篮|碗|盘|案|灯|火|网|绳|刀|剑|枪|棍|杆|铲|锄|秤|鞭|牌|纸|布|衣|帽|鞋|锁|钥匙|缝|洞|根|座|包|角|格|屉|沟|桥|坞|板|丛|身|道)/.test(h);
+}
+
+async function cmdAiSmell() {
+  const targets = checkTargetFiles('ai-smell', '--file 剧本.txt 或 --dir <目录>');
+  const banned = /不是[^。！？]{0,30}而是|仿佛|似乎|不由得|与此同时|这一刻|命运|宿命|终于明白|空气安静|鸦雀无声|五味杂陈|嘴角弧度|眼底闪过/;
+  const limits = { '奶声奶气': 1, '缓缓': 1, '轻轻': 1, '默默': 1, '静静': 1 };
+  let total = 0; const window = [];
+  for (const f of targets) {
+    const n = episodeNoOfFile(path.basename(f));
+    const text = fs.readFileSync(f, 'utf8');
+    const { scenes } = parseCheckScript(text);
+    const issues = [];
+    const all = scenes.map((s) => s.dialogue.map((d) => d.line).join('\n') + '\n' + s.actions.map((a) => a.line).join('\n')).join('\n');
+    const bm = all.match(banned);
+    if (bm) issues.push('违禁 AI 腔：' + bm[0]);
+    const paren = [...all.matchAll(/（([^）]*)）/g)].map((m) => m[1]).join('\n');
+    for (const [w, lim] of Object.entries(limits)) {
+      const c = (paren.match(new RegExp(w, 'g')) || []).length;
+      if (c > lim) issues.push('重复括注：' + w + '×' + c + '（上限' + lim + '）');
+    }
+    const y = (paren.match(/一字一句/g) || []).length;
+    window.push({ n, y }); if (window.length > 3) window.shift(); if (window.reduce((a, b) => a + b.y, 0) > 1) issues.push('三集内「一字一句」超限');
+    if (/从今以后|原来一切都是|她终于明白/.test(all)) issues.push('总结式台词');
+    console.log('── ' + path.basename(f) + '  台词' + scenes.reduce((a, s) => a + s.dialogue.length, 0) + '句');
+    for (const x of issues) console.log('  ✗ ' + x);
+    total += issues.length;
+  }
+  if (total) { console.log('AI_SMELL_FAIL 硬伤' + total + '处'); process.exit(1); }
+  console.log('AI_SMELL_PASS');
+}
+
+async function cmdPlotCheck() {
+  const targets = checkTargetFiles('plot-check', '--file 剧本.txt 或 --dir <目录>');
+  let total = 0;
+  for (const f of targets) {
+    const text = fs.readFileSync(f, 'utf8');
+    const { scenes } = parseCheckScript(text);
+    const issues = []; const warns = [];
+    const seenActs = new Map();
+    for (const s of scenes) {
+      for (const d of s.dialogue) {
+        for (const who of d.who.split('、').map((x) => x.trim()).filter(Boolean)) {
+          if (who !== '海的声音' && !s.people.includes(who)) issues.push('第' + d.lineNo + '行 说话人不在人物行：' + who);
+        }
+      }
+      for (const h of s.props) if (h && !s.people.includes(h) && !isLocationHolder(h)) issues.push('道具持有人不在场：' + h);
+      for (const a of s.actions) seenActs.set(a.line, (seenActs.get(a.line) || 0) + 1);
+      if (s.img.length) {
+        const byBase = new Map();
+        for (const x of s.img) {
+          if (!byBase.has(x.base)) byBase.set(x.base, new Set());
+          byBase.get(x.base).add(x.variant);
+        }
+        for (const [base, vars] of byBase) {
+          const genericRole = /村民|海盗|衙役|护卫|护院|伙计|管事|小孩|婆子|大夫|船夫|渔户|客人|路人|守门官|官差|家丁|打手|随从|众人|宾客|看客|摊贩|军士|差役|妇人|汉子/.test(base);
+          if (vars.has(base) && !genericRole) issues.push('兜底形象标签：[' + base + '-' + base + ']');
+          const arr = [...vars];
+          if (arr.length > 1) {
+            const near = arr.some((a) => arr.some((b) => a !== b && (a.includes(b) || b.includes(a))));
+            if (near) issues.push('近义形象变体重复：' + base + '（' + arr.join(' / ') + '）');
+            else warns.push('同一角色多个形象变体，确认是否剧情换装：' + base + '（' + arr.join(' / ') + '）');
+          }
+        }
+      }
+      if (scenes.length > 2) warns.push('本集超过2场');
+    }
+    for (const [a, c] of seenActs) if (c > 1) issues.push('重复△×' + c + '：' + a.slice(0, 24));
+    console.log('── ' + path.basename(f) + '  场' + scenes.length);
+    for (const x of issues) console.log('  ✗ ' + x);
+    for (const x of warns) console.log('  ⚠ ' + x);
+    total += issues.length;
+  }
+  if (total) { console.log('PLOT_FAIL 硬伤' + total + '处'); process.exit(1); }
+  console.log('PLOT_PASS');
+}
+
+async function cmdPaceCheck() {
+  const targets = checkTargetFiles('pace-check', '--file 剧本.txt 或 --dir <目录>');
+  let hard = 0, warn = 0; const durs = [];
+  for (const f of targets) {
+    const n = episodeNoOfFile(path.basename(f));
+    const { scenes } = parseCheckScript(fs.readFileSync(f, 'utf8'));
+    let chars = 0, acts = 0;
+    for (const s of scenes) {
+      for (const d of s.dialogue) chars += d.line.replace(/^[^：:]*[：:]/, '').replace(/（[^）]*）/g, '').length;
+      acts += s.actions.length;
+    }
+    const dur = Math.round(chars / 4.5 + acts * 1.4);
+    durs.push(dur);
+    const issues = [];
+    // 空镜头诊断：连续△段 + 纯环境描写
+    const raw = fs.readFileSync(f, 'utf8').split(/\r?\n/);
+    let run = 0, emptyRuns = 0, scenery = 0;
+    for (const line of raw) {
+      if (/^△/.test(line)) {
+        run += 1;
+        if (run === 3) emptyRuns += 1;
+        if (/^△(海风|海浪|浪花|潮水|潮声|天色|日头|月光|晨光|夕阳|夜色|远处|海面|礁石|码头|院子里|屋里|门外|镜头|画面)/.test(line)) scenery += 1;
+      } else if (line.trim() && !line.startsWith('【') && !line.startsWith('人物：') && !/^\d+-\d+\s/.test(line)) {
+        run = 0;
+      }
+    }
+    if (emptyRuns) { issues.push('连续空镜头段' + emptyRuns + '处'); warn += 1; }
+    if (scenery >= 3) { issues.push('纯环境空镜' + scenery + '行'); warn += 1; }
+    if (dur > 110) { issues.push('估时' + dur + '秒>110'); hard += 1; }
+    else if (dur > 90) { issues.push('估时' + dur + '秒>90'); warn += 1; }
+    else if (dur < 45) { issues.push('估时' + dur + '秒<45'); warn += 1; }
+    if (scenes.length > 2) { issues.push('场次' + scenes.length + '个>2'); warn += 1; }
+    if ([10, 20, 30, 40, 50].includes(n)) {
+      const tail = scenes.flatMap((s) => s.dialogue.map((d) => d.line)).slice(-8).join(' ');
+      if (!/倒计时|威胁|死|杀|炸|封|抓|抢|烧|跑|追|今晚|明日|三天|一个时辰|再不走|来不及|救|逃/.test(tail)) { issues.push('付费卡点结尾需人工确认'); warn += 1; }
+    }
+    console.log('── ' + path.basename(f) + '  估时' + dur + '秒');
+    for (const x of issues) console.log('  ' + (x.includes('>110') ? '✗ ' : '⚠ ') + x);
+  }
+  const avg = durs.length ? Math.round(durs.reduce((a, b) => a + b, 0) / durs.length) : 0;
+  if (avg > 75 || avg < 50) { console.log('⚠ 全剧平均' + avg + '秒，超出60±10'); warn += 1; }
+  if (hard) { console.log('PACE_FAIL 硬伤' + hard + '处 警告' + warn + '处'); process.exit(1); }
+  console.log('PACE_PASS' + (warn ? ' （警告' + warn + '处）' : ''));
+}
+
+
+
+// ---------- pace-fix：压缩空镜头/环境行，不动台词（v2.38.2） ----------
+function paceOfLines(lines) {
+  let chars = 0, acts = 0;
+  for (const line of lines) {
+    if (/^△/.test(line)) { acts += 1; continue; }
+    if (!line.trim() || line.startsWith('【') || line.startsWith('人物：') || /^第\d+集/.test(line) || /^\d+-\d+\s/.test(line)) continue;
+    const m = line.match(/^([^：△【\s]{1,12})[：:](.*)$/);
+    if (m) chars += m[2].replace(/（[^）]*）/g, '').length;
+  }
+  return Math.round(chars / 4.5 + acts * 1.4);
+}
+
+async function cmdPaceFix() {
+  const targets = checkTargetFiles('pace-fix', '--file 剧本.txt 或 --dir <目录> [--dry-run]');
+  const dry = flag('dry-run');
+  const envRe = /^△(海风|海浪|浪花|潮水|潮声|天色|日头|月光|晨光|夕阳|夜色|远处|海面|礁石|码头|院子里|屋里|门外|镜头|画面)/;
+  const fillerRe = /抬眼看向.*没有立刻接话|手指收紧，脚步停了半拍|抿了抿嘴，视线落回|往旁边让了半步，神色没有松|低头看了看手里的东西，又抬起头|的呼吸顿了一下，没有马上开口|肩背绷紧，站在原地没动|看了看.*又看了看周围的人|把手里的活计放下，转过身来|偏过头，避开.*目光|往前迈了半步，又停住|把手往袖子里缩了缩，嘴唇抿紧|眨眨眼，小脚往前挪了半步|仰着小脸，看看|抱住.*腿，探出半个脑袋|把小手里的东西攥紧，仰头看了看/;
+  let fixed = 0, partial = 0;
+  for (const f of targets) {
+    const raw = fs.readFileSync(f, 'utf8').replace(/\r/g, '');
+    let lines = raw.split('\n');
+    const before = paceOfLines(lines);
+    let envCount = 0;
+    for (const line of lines) if (/^△/.test(line) && envRe.test(line)) envCount += 1;
+    const target = before > 105 ? 105 : (before > 90 ? Math.max(90, before - 12) : (envCount >= 5 ? Math.max(75, before - 10) : 0));
+    if (!target) continue;
+    const removable = [];
+    for (let i = 0; i < lines.length; i += 1) {
+      if (!lines[i].startsWith('△')) continue;
+      const prev = lines[i - 1] || '';
+      const next = lines[i + 1] || '';
+      if (!prev.startsWith('△') && !next.startsWith('△')) continue;
+      if (envRe.test(lines[i]) || fillerRe.test(lines[i])) removable.push(i);
+    }
+    for (const i of removable.sort((a, b) => b - a)) {
+      if (paceOfLines(lines) <= target) break;
+      lines.splice(i, 1);
+    }
+    const after = paceOfLines(lines);
+    if (after !== before) {
+      if (!dry) {
+        const bak = f + '.bak-pacefix';
+        if (!fs.existsSync(bak)) fs.copyFileSync(f, bak);
+        fs.writeFileSync(f, lines.join('\n'), 'utf8');
+      }
+      fixed += 1;
+    }
+    if (after > 110) partial += 1;
+    console.log('── ' + path.basename(f) + '  ' + before + '秒 → ' + after + '秒' + (dry ? '（试运行）' : ''));
+  }
+  if (!fixed) { console.log('PACE_FIX_PASS 没有需要压的空镜头'); return; }
+  if (partial) { console.log('PACE_FIX_PARTIAL 已压 ' + fixed + ' 集，仍有 ' + partial + ' 集>110秒，需人工拆集/并场'); process.exit(1); }
+  console.log('PACE_FIX_PASS 已压 ' + fixed + ' 集');
+}
+
+
+// ---------- gender-check：性转/男女互换洗稿的确定性校验（v2.38.4） ----------
+// 用法：gender-check --file 剧本.txt [--map 性别映射.json] [--allow 允许清单.json]
+// map:   {"宋启兰":"female","孙秀云":"male"}  或  {"characters":[{"name":"宋启兰","from":"male","to":"female"}]}
+// allow: {"lines":[{"line":54,"reason":"「他」指沈立诚"}]}
+const GC_FEMALE_TOKENS = /她(?!们)|女人|中年女人|老太太|妻子|女士|小姐|大妈|大娘|妇人/;
+const GC_MALE_TOKENS = /他(?!们)|男人|中年男人|老年男人|老头|老爷子|丈夫|先生|男士|小伙/;
+const GC_ADDR_FEMALE = new Set(['妈', '奶奶', '婆婆', '阿姨', '妻子', '老婆', '闺女', '女儿', '孙女']);
+const GC_ADDR_MALE = new Set(['爸', '爷爷', '公公', '大爷', '叔叔', '儿子', '孙子', '先生']);
+
+function gcLoadMap() {
+  const f = arg('map', '');
+  if (!f) return {};
+  const p = path.resolve(f);
+  if (!fs.existsSync(p)) die('找不到性别映射文件: ' + p);
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { die('性别映射 JSON 解析失败: ' + e.message); }
+  const out = {};
+  for (const [k, v] of Object.entries(raw || {})) {
+    if (k === 'characters') continue;
+    if (typeof v === 'string') out[k] = v.toLowerCase().startsWith('f') || v === '女' ? 'female' : 'male';
+    else if (v && typeof v === 'object' && v.to) out[k] = String(v.to).toLowerCase().startsWith('f') || v.to === '女' ? 'female' : 'male';
+  }
+  for (const c of (raw?.characters || [])) {
+    if (c?.name && c?.to) out[c.name] = String(c.to).toLowerCase().startsWith('f') || c.to === '女' ? 'female' : 'male';
+  }
+  return out;
+}
+
+function gcLoadAllow() {
+  const f = arg('allow', '');
+  if (!f) return new Map();
+  const p = path.resolve(f);
+  if (!fs.existsSync(p)) die('找不到允许清单: ' + p);
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) { die('允许清单 JSON 解析失败: ' + e.message); }
+  const m = new Map();
+  for (const item of (raw?.lines || [])) if (item?.line) m.set(Number(item.line), String(item.reason || '已确认'));
+  return m;
+}
+
+async function cmdGenderCheck() {
+  const targets = checkTargetFiles('gender-check', '--file 剧本.txt 或 --dir <目录> [--map 性别映射.json] [--allow 允许清单.json]');
+  const genderOf = gcLoadMap();
+  const allow = gcLoadAllow();
+  let total = 0;
+  for (const f of targets) {
+    const text = fs.readFileSync(f, 'utf8');
+    const lines = text.replace(/\r/g, '').split('\n');
+    const issues = [];
+    let people = [];
+    const known = new Set(Object.keys(genderOf));
+    const sameGenderNames = (g) => Object.keys(genderOf).filter((n) => genderOf[n] === g);
+
+    lines.forEach((line, idx) => {
+      const n = idx + 1;
+      const s = line.trim();
+      if (!s) return;
+      const pm = s.match(/^(人物|出场人物)[：:](.*)$/);
+      if (pm) { people = pm[2].split(/[、，,]/).map((x) => x.trim()).filter(Boolean); return; }
+      if (/^\d+-\d+/.test(s)) { people = []; return; }
+      if (allow.has(n)) return;
+
+      // R1：同句里出现被改角色 + 与其新性别相反的词，且同句没有同性别角色可指
+      for (const name of known) {
+        if (!s.includes(name)) continue;
+        const g = genderOf[name];
+        const bad = g === 'female' ? GC_MALE_TOKENS : GC_FEMALE_TOKENS;
+        const good = g === 'female' ? GC_FEMALE_TOKENS : GC_MALE_TOKENS;
+        const m = s.match(bad);
+        if (!m) continue;
+        const sameG = sameGenderNames(g).filter((x) => x !== name && s.includes(x));
+        const otherG = sameGenderNames(g === 'female' ? 'male' : 'female').filter((x) => s.includes(x));
+        if (sameG.length) continue;
+        if (otherG.length && (g === 'female' ? /她/.test(m[0]) : /他/.test(m[0]))) continue;
+        issues.push(`第${n}行 ${name}（${g === 'female' ? '女' : '男'}）出现反向词「${m[0]}」：${s.slice(0, 40)}`);
+      }
+
+      // R2：场景称呼与在场人的性别不符
+      const am = s.match(/^[^：]{0,24}[：:]\s*["“]?(妈|爸|奶奶|爷爷|婆婆|公公|大爷|阿姨|奶奶)[，。！？、]/);
+      if (am && people.length) {
+        const addr = am[1];
+        const addrGender = GC_ADDR_FEMALE.has(addr) ? 'female' : 'male';
+        const inScene = people.filter((p) => genderOf[p]);
+        const same = inScene.filter((p) => genderOf[p] === addrGender);
+        const diff = inScene.filter((p) => genderOf[p] !== addrGender);
+        if (!same.length && diff.length) {
+          issues.push(`第${n}行 场景里只有 ${diff.map((p) => p + '(' + (genderOf[p] === 'female' ? '女' : '男') + ')').join('、')}，却用「${addr}」称呼：${s.slice(0, 40)}`);
+        }
+      }
+    });
+
+    console.log('── ' + path.basename(f) + '  角色映射 ' + Object.keys(genderOf).length + ' 个');
+    for (const x of issues) console.log('  ✗ ' + x);
+    total += issues.length;
+  }
+  if (!Object.keys(genderOf).length) {
+    console.log('⚠ 没有 --map：只做了场景称呼检查。性转洗稿请提供性别映射，才能查指代与外观。');
+  }
+  if (total) { console.log('GENDER_FAIL 共 ' + total + ' 处，修到 0 再交付'); process.exit(1); }
+  console.log('GENDER_PASS');
+}
+
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'ai-smell': cmdAiSmell, 'plot-check': cmdPlotCheck, 'pace-check': cmdPaceCheck, 'pace-fix': cmdPaceFix, 'gender-check': cmdGenderCheck, renumber: cmdRenumber, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (EDITION === 'gate' && commands[cmd] && !GATE_COMMANDS.has(cmd)) {
     console.log(`「${cmd}」需要账号授权，属于辰屿 Pro 完整版功能（视频反推、形象设计、平台交付等）。免费版可用的命令见 chenyu-gate help。`);
@@ -3979,3 +4321,5 @@ try {
   console.error('✗ 出错: ' + (err?.stack || err?.message || err));
   process.exit(1);
 }
+
+// MARKER_TEST_123
