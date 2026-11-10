@@ -9,6 +9,8 @@ $files = @(
   "SKILL.md",
   "references/分镜写作守则.md",
   "scripts/chenyu_cli.mjs",
+  "scripts/chenyu_pro_cli.mjs",
+  "scripts/chenyu_gate_cli.mjs",
   "scripts/net.mjs",
   "scripts/asset_workbook.mjs",
   "scripts/asset_export.mjs",

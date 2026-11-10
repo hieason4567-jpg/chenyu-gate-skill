@@ -3878,7 +3878,7 @@ function cmdGuide() {
 
 // 线上最新版：读 GitHub 上本版本（Pro / 免费版）的 SKILL.md 版本号。本机装的副本不会自己更新，
 // Agent 只看本地文件会以为旧版就是最新（2026-10-03 有 Agent 把 2.10.0 当最新）。
-const SKILL_RAW_BASE = `https://raw.githubusercontent.com/hieason4567-jpg/${EDITION === 'gate' ? 'chenyu-gate-skill' : 'chenyu-pro-skill'}/main`;
+const SKILL_RAW_BASE = 'https://raw.githubusercontent.com/hieason4567-jpg/chenyu-gate-skill/main';
 const compareVersions = (a, b) => {
   const x = String(a).split('.').map(Number), y = String(b).split('.').map(Number);
   for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) - (y[i] || 0);
