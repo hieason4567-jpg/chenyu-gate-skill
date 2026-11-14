@@ -30,6 +30,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 // v2.39.1 2026-11-09  gate 增两条警告：△只写状态没有起承转合、情绪括注里写动作（递出/塞进/摆手等）；动作必须写"触发→过程→停在哪→对方反应"。
 // v2.39.2 2026-11-09  新增 act-fix：把"只有状态"的 △ 重排成起承转合（只重排原句成分，缺反馈留 [反馈待补]）。
 // v2.40.0 2026-11-09  合并 PRO/GATE 后正式版：含正文生命力六条、act-fix、review-check 八项审稿单（4 机器 + 4 需人判）。
+// v2.40.1 2026-11-14  新增 looks-convert：把 character-appearance-extract/v1 转成客户端可导入的 chenyu.look-table/v1（支持 --main 指定主形象）。
 //                    gate / looks-prepare / asset-export 同时兼容旧写法；变体名≤8字、不含 - 和括号。
 // v2.37.1 2026-10-24  形象换装原因可以用前面的换装△证明，不再强制在形象行写括号（与「形象行禁止括号」配套）。
 // v2.37.0 2026-10-24  形象行禁止括号：境界/伤势/威压/光效/换装原因写进△或台词，客户端会把括号内容当新形象标签
@@ -244,7 +245,7 @@ import { annotateDurations, shiftWaivers } from './durations.mjs';
 //                    Agent 自己能读懂视频时应自行分析，不调本命令。
 // v2.3.1 2026-09-13  视频一律走平台反推：禁止 Agent 用抽音频/转写/抽帧代替(只有台词没画面,
 //                    洗出剧本乱改动大)；移除"能读懂视频就自己分析"的引导口径。
-const VERSION = '2.40.0';
+const VERSION = '2.40.1';
 // 每个请求都带上版本号：平台日志(nginx UA 列)据此看出客户在用哪一版、有没有人在用改包版。
 const CLI_UA = `chenyu-pro-cli/${VERSION} node/${process.versions.node}`;
 
@@ -294,7 +295,7 @@ const args = process.argv.slice(2);
 const EDITION = process.env.CHENYU_EDITION === 'gate' ? 'gate' : 'pro';
 // 免费版老用法「chenyu --file 剧本.txt / --dir 目录」= 格式门
 const cmd = EDITION === 'gate' && /^--(file|dir)$/.test(args[0] || '') ? 'gate' : (args[0] || 'help');
-const GATE_COMMANDS = new Set(['gate', 'renumber', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations', 'ai-smell', 'plot-check', 'pace-check', 'pace-fix', 'gender-check', 'act-fix', 'review-check',
+const GATE_COMMANDS = new Set(['gate', 'renumber', 'deliver', 'variants', 'inspect', 'wash-check', 'deliver-check', 'rename', 'text-analyze', 'next', 'assets-prepare', 'assets-apply', 'assets-export', 'durations', 'ai-smell', 'plot-check', 'pace-check', 'pace-fix', 'gender-check', 'act-fix', 'review-check', 'looks-convert',
   'remake-prepare', 'remake-units', 'remake-lint', 'remake-review', 'remake-apply', 'guide', 'help', 'version', '--version', '-v']);
 
 // PRO 专属：需要辰屿账号（或积分 KEY）。分发层统一校验，命令内部不再各自判断。
@@ -3910,6 +3911,7 @@ function cmdHelp() {
   chenyu gender-check --file 剧本.txt --map 性别映射.json 性转洗稿校验，到 GENDER_PASS
   chenyu act-fix --file 剧本.txt | --dir <目录> [--dry-run] 把"只有状态"的△补成起承转合
   chenyu review-check --file 剧本.txt | --dir <目录> [--out <报告目录>] 交付前八项审稿单
+  chenyu looks-convert --src 人物角色形象表.json --out 形象表.json 转成客户端可导入格式
   chenyu renumber --file 剧本.txt | --dir <目录>   集号、场次号按规范自动改正
   chenyu variants --dir <目录>                       汇总每个人物的形象
   chenyu rename --dir <目录> …                        按改名表精确换名
@@ -4469,7 +4471,97 @@ async function cmdReviewCheck() {
   console.log(`REVIEW_PASS 机器项全过（4 项需人判）；报告：${outFile}`);
 }
 
-const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'ai-smell': cmdAiSmell, 'plot-check': cmdPlotCheck, 'pace-check': cmdPaceCheck, 'pace-fix': cmdPaceFix, 'gender-check': cmdGenderCheck, 'act-fix': cmdActFix, 'review-check': cmdReviewCheck, renumber: cmdRenumber, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
+// ---------- looks-convert：形象提取表 → 客户端可导入形象表（v2.40.1） ----------
+// 背景：character-appearance-extract/v1 是提取中间产物，客户端只认 chenyu.look-table/v1。
+// 用法：looks-convert --src 人物角色形象表.json --out 形象表.json [--main 角色=变体,角色=变体]
+const LC_TAG_FORBIDDEN = /[\[\]【】\s\-]/;
+
+function lcCleanVariant(v) {
+  return String(v || '').replace(/[\[\]【】\s]/g, '').replace(/-/g, '').slice(0, 8);
+}
+
+function lcEpisodes(text, fallback) {
+  const set = new Set();
+  for (const m of String(text || '').matchAll(/(\d{1,3})(?:\s*[-–—~至]\s*(\d{1,3}))?/g)) {
+    const a = Number(m[1]);
+    const b = m[2] ? Number(m[2]) : a;
+    if (!a || a > 200) continue;
+    for (let n = Math.min(a, b); n <= Math.max(a, b) && n - Math.min(a, b) < 100; n += 1) set.add(n);
+  }
+  if (!set.size && Array.isArray(fallback)) fallback.forEach((n) => set.add(Number(n)));
+  return [...set].filter((n) => Number.isInteger(n) && n > 0).sort((x, y) => x - y);
+}
+
+async function cmdLooksConvert() {
+  const src = arg('src', '');
+  const out = arg('out', '');
+  if (!src || !out) die('用法: chenyu looks-convert --src 人物角色形象表.json --out 形象表.json [--main 角色=变体,...]');
+  const srcPath = path.resolve(src);
+  if (!fs.existsSync(srcPath)) die('找不到源文件: ' + srcPath);
+  let raw;
+  try { raw = JSON.parse(fs.readFileSync(srcPath, 'utf8').replace(/^﻿/, '')); } catch (e) { die('源文件不是有效 JSON: ' + e.message); }
+  if (raw.schema && raw.schema !== 'character-appearance-extract/v1' && raw.schema !== 'chenyu.look-table/v1') {
+    die('不认识的源格式: ' + raw.schema + '（支持 character-appearance-extract/v1 或已是 chenyu.look-table/v1）');
+  }
+
+  const mains = new Map();
+  for (const part of String(arg('main', '') || '').split(/[,，]/)) {
+    const [who, variant] = part.split('=');
+    if (who && variant) mains.set(who.trim(), lcCleanVariant(variant));
+  }
+
+  let table;
+  if (raw.schema === 'chenyu.look-table/v1') {
+    table = raw;
+  } else {
+    const characters = (raw.characters || []).map((c) => {
+      const looks = (c.looks || []).map((l) => ({
+        variant: lcCleanVariant(l.label || l.variant),
+        appearance: [l.sourceFacts, l.suggestion].filter(Boolean).join('；').trim() || String(c.sourceAppearance || '').trim(),
+        episodes: lcEpisodes(l.episodes, c.appearanceEpisodes),
+        reason: '',
+      })).filter((l) => l.variant);
+      const override = mains.get(c.name);
+      const idx = override ? looks.findIndex((l) => l.variant === override) : 0;
+      looks.forEach((l, i) => { l.main = i === (idx >= 0 ? idx : 0); });
+      return { name: c.name, kind: c.kind === 'group' ? 'group' : c.kind === 'creature' ? 'creature' : 'human', looks };
+    }).filter((c) => c.name && c.looks.length);
+
+    table = {
+      schema: 'chenyu.look-table/v1',
+      title: raw.title || path.basename(out, '.json'),
+      characters,
+      scenes: {},
+      fileName: path.basename(out),
+      importedAt: new Date().toISOString(),
+    };
+  }
+
+  // 自检：客户端只在这两处判硬错，另给出会警告的问题
+  const problems = [];
+  if (table.schema !== 'chenyu.look-table/v1') problems.push('schema 不是 chenyu.look-table/v1');
+  if (!Array.isArray(table.characters) || !table.characters.length) problems.push('characters 为空');
+  const warns = [];
+  for (const c of table.characters || []) {
+    if (LC_TAG_FORBIDDEN.test(c.name)) warns.push(`角色名「${c.name}」含方括号/空格/连字符`);
+    if (!c.looks?.length) warns.push(`角色「${c.name}」没有形象`);
+    for (const l of c.looks || []) {
+      if (LC_TAG_FORBIDDEN.test(l.variant)) warns.push(`变体名「${l.variant}」含方括号/空格/连字符`);
+      if (!l.appearance) warns.push(`[${c.name}-${l.variant}] 没写外观`);
+    }
+  }
+
+  fs.mkdirSync(path.dirname(path.resolve(out)), { recursive: true });
+  fs.writeFileSync(path.resolve(out), JSON.stringify(table, null, 2), 'utf8');
+  const looks = (table.characters || []).reduce((n, c) => n + (c.looks?.length || 0), 0);
+  console.log(`✓ 已生成 ${path.resolve(out)}`);
+  console.log(`  角色 ${table.characters?.length || 0} 个，形象 ${looks} 个，scenes ${Object.keys(table.scenes || {}).length} 集`);
+  for (const w of warns) console.log('  ⚠ ' + w);
+  if (problems.length) { for (const p of problems) console.log('  ✗ ' + p); console.log('LOOKS_CONVERT_FAIL'); process.exit(1); }
+  console.log('LOOKS_CONVERT_PASS 可直接在客户端「人物设定与故事背景」导入');
+}
+
+const commands = { login: cmdLogin, key: cmdKey, credits: cmdCredits, status: cmdStatus, fetch: cmdFetch, sync: cmdSync, projects: cmdProjects, auth: cmdAuth, create: cmdCreate, save: cmdSave, gate: cmdGate, 'ai-smell': cmdAiSmell, 'plot-check': cmdPlotCheck, 'pace-check': cmdPaceCheck, 'pace-fix': cmdPaceFix, 'gender-check': cmdGenderCheck, 'act-fix': cmdActFix, 'review-check': cmdReviewCheck, 'looks-convert': cmdLooksConvert, renumber: cmdRenumber, variants: cmdVariants, 'video-analyze': cmdVideoAnalyze, 'video-fetch': cmdVideoFetch, 'video-wait': cmdVideoWait, archive: cmdArchive, 'archive-fetch': cmdArchiveFetch, 'asset-image': cmdAssetImage, deliver: cmdDeliver, 'review-split': cmdReviewSplit, 'review-merge': cmdReviewMerge, 'video-rebuild': cmdVideoRebuild, 'text-analyze': cmdTextAnalyze, next: cmdNext, 'assets-prepare': cmdAssetsPrepare, 'assets-apply': cmdAssetsApply, rename: cmdRename, 'wash-check': cmdWashCheck, 'deliver-check': cmdDeliverCheck, 'assets-export': cmdAssetsExport, durations: cmdDurations, 'looks-prepare': cmdLooksPrepare, inspect: cmdInspect, 'remake-prepare': cmdRemakePrepare, 'remake-units': cmdRemakeUnits, 'remake-apply': cmdRemakeApply, 'remake-lint': cmdRemakeLint, 'remake-review': cmdRemakeReview, version: cmdVersion, ffmpeg: cmdFfmpeg, guide: cmdGuide, '--version': cmdVersion, '-v': cmdVersion, help: cmdHelp };
 try {
   if (commands[cmd] && AUTH_REQUIRED.has(cmd)) {
     const cfg = loadConfig();

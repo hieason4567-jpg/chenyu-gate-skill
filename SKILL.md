@@ -2,10 +2,10 @@
 name: chenyu
 description: 辰屿 —— 短剧剧本生产与质检（合并版 Skill，含免费命令与需授权的 PRO 命令）。写/生成/洗稿/改编短剧剧本、视频反推剧本、剧本格式门与质检时使用。用户一句话提到「辰屿」「辰屿技能」「用辰屿改编 / 反推 / 分析视频 / 洗稿 / 改名 / 出形象表 / 出资产图」就用本 Skill，不需要用户说出命令。
 metadata:
-  version: "2.40.0"
+  version: "2.40.1"
 ---
 
-# 辰屿 —— 短剧剧本生产与质检（合并版 v2.40.0）
+# 辰屿 —— 短剧剧本生产与质检（合并版 v2.40.1）
 
 > **本技能 = 原 chenyu-pro + chenyu-gate 合并**：一份实现、一个入口 `chenyu`。
 > 老命令名 `chenyu-pro` / `chenyu-gate` 仍可用（兼容壳，指向同一份实现），但它们写过的内容不再单独维护。
@@ -14,7 +14,7 @@ metadata:
 
 | 级别 | 命令 | 说明 |
 |---|---|---|
-| 免费（不联网、零积分） | gate、ai-smell、plot-check、pace-check、pace-fix、gender-check、act-fix、review-check、renumber、variants、rename、wash-check、deliver-check、inspect、durations、assets-prepare/apply/export、text-analyze、remake-*、review-split/merge、next、guide、help、version | 直接跑，不要账号 |
+| 免费（不联网、零积分） | gate、ai-smell、plot-check、pace-check、pace-fix、gender-check、act-fix、review-check、looks-convert、renumber、variants、rename、wash-check、deliver-check、inspect、durations、assets-prepare/apply/export、text-analyze、remake-*、review-split/merge、next、guide、help、version | 直接跑，不要账号 |
 | 需授权（辰屿账号或积分 KEY） | create、save、fetch、sync、projects、status、archive、archive-fetch、deliver、looks-prepare、video-analyze、video-fetch、video-wait、video-rebuild、asset-image | 未授权时命令会明确提示先 `chenyu auth` 或 `chenyu key set <KEY>` |
 | 需授权 + 扣积分 | video-analyze、video-rebuild、asset-image | 先报价、用户同意后才加 `--yes` |
 
@@ -495,6 +495,19 @@ N-1 日/夜 内/外 场景名
 **初稿偏短怎么办**：低于 45 秒按"补拍三选一"补——① 旁人反应 ② 第二次尝试（再敲一次门、再递一次东西）③ 物件交换（钱、钥匙、信物）。**不许用电话、敲门、来人这类新事件凑时长**，那会同时破坏第 6 条。
 
 **一集场次**：≤2 场，优先单场；超过 2 场必须有明确理由（空间必须换）。
+
+## 形象表：客户端只认 chenyu.look-table/v1
+
+`text-analyze` / `assets-prepare` 产出的 `人物角色形象表.json` 是 **character-appearance-extract/v1**，属于提取中间产物，**客户端导入会报「不认识的形象表版本」**。
+
+要交给客户端导入时，先转换：
+
+```bash
+chenyu looks-convert --src 人物角色形象表.json --out 形象表.json
+# 需要指定主形象：--main "林砚峰=炫富店主,苏念禾=落魄求职"
+```
+
+输出为 `chenyu.look-table/v1`，可直接在客户端「人物设定与故事背景」导入。转换只改结构（label→variant、episodes 解析、主形象标记），不改内容；`scenes` 为空时客户端按分场规则绑形象，需要逐场精确就再跑 `looks-prepare` + `assets-export`。
 
 ## 交付前八项审稿单
 
